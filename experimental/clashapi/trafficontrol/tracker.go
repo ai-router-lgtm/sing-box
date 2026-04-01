@@ -2,6 +2,7 @@ package trafficontrol
 
 import (
 	"net"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -13,6 +14,13 @@ import (
 	N "github.com/sagernet/sing/common/network"
 
 	"github.com/gofrs/uuid/v5"
+)
+
+type trafficDirection uint8
+
+const (
+	directionUpload trafficDirection = iota + 1
+	directionDownload
 )
 
 type TrackerMetadata struct {
@@ -147,14 +155,23 @@ func NewTCPTracker(conn net.Conn, manager *Manager, metadata adapter.InboundCont
 	}
 	upload := new(atomic.Int64)
 	download := new(atomic.Int64)
+	var readCounters []N.CountFunc
+	var writeCounters []N.CountFunc
+	principal := strings.TrimSpace(metadata.User)
+	if principal != "" {
+		readCounters = append(readCounters, buildDynamicRateLimitCountFunc(manager, principal, directionUpload))
+		writeCounters = append(writeCounters, buildDynamicRateLimitCountFunc(manager, principal, directionDownload))
+	}
+	readCounters = append(readCounters, func(n int64) {
+		upload.Add(n)
+		manager.PushUploaded(n)
+	})
+	writeCounters = append(writeCounters, func(n int64) {
+		download.Add(n)
+		manager.PushDownloaded(n)
+	})
 	tracker := &TCPConn{
-		ExtendedConn: bufio.NewCounterConn(conn, []N.CountFunc{func(n int64) {
-			upload.Add(n)
-			manager.PushUploaded(n)
-		}}, []N.CountFunc{func(n int64) {
-			download.Add(n)
-			manager.PushDownloaded(n)
-		}}),
+		ExtendedConn: bufio.NewCounterConn(conn, readCounters, writeCounters),
 		metadata: TrackerMetadata{
 			ID:           id,
 			Metadata:     metadata,
@@ -228,14 +245,23 @@ func NewUDPTracker(conn N.PacketConn, manager *Manager, metadata adapter.Inbound
 	}
 	upload := new(atomic.Int64)
 	download := new(atomic.Int64)
+	var readCounters []N.CountFunc
+	var writeCounters []N.CountFunc
+	principal := strings.TrimSpace(metadata.User)
+	if principal != "" {
+		readCounters = append(readCounters, buildDynamicRateLimitCountFunc(manager, principal, directionUpload))
+		writeCounters = append(writeCounters, buildDynamicRateLimitCountFunc(manager, principal, directionDownload))
+	}
+	readCounters = append(readCounters, func(n int64) {
+		upload.Add(n)
+		manager.PushUploaded(n)
+	})
+	writeCounters = append(writeCounters, func(n int64) {
+		download.Add(n)
+		manager.PushDownloaded(n)
+	})
 	trackerConn := &UDPConn{
-		PacketConn: bufio.NewCounterPacketConn(conn, []N.CountFunc{func(n int64) {
-			upload.Add(n)
-			manager.PushUploaded(n)
-		}}, []N.CountFunc{func(n int64) {
-			download.Add(n)
-			manager.PushDownloaded(n)
-		}}),
+		PacketConn: bufio.NewCounterPacketConn(conn, readCounters, writeCounters),
 		metadata: TrackerMetadata{
 			ID:           id,
 			Metadata:     metadata,
@@ -251,4 +277,32 @@ func NewUDPTracker(conn N.PacketConn, manager *Manager, metadata adapter.Inbound
 	}
 	manager.Join(trackerConn)
 	return trackerConn
+}
+
+func buildDynamicRateLimitCountFunc(manager *Manager, principal string, direction trafficDirection) N.CountFunc {
+	return func(n int64) {
+		if n <= 0 {
+			return
+		}
+		policy, ok := manager.PolicyForPrincipal(principal)
+		if !ok {
+			return
+		}
+		var bytesPerSecond int64
+		switch direction {
+		case directionUpload:
+			bytesPerSecond = policy.UpBPS
+		case directionDownload:
+			bytesPerSecond = policy.DownBPS
+		default:
+			return
+		}
+		if bytesPerSecond <= 0 {
+			return
+		}
+		delay := time.Duration(float64(n) / float64(bytesPerSecond) * float64(time.Second))
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+	}
 }

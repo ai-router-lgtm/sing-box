@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -20,6 +22,7 @@ import (
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
 	E "github.com/sagernet/sing/common/exceptions"
+	F "github.com/sagernet/sing/common/format"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
@@ -36,6 +39,8 @@ type Inbound struct {
 	tlsConfig    tls.ServerConfig
 	service      *hysteria2.Service[int]
 	userNameList []string
+	users        []option.Hysteria2User
+	userAccess   sync.RWMutex
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.Hysteria2InboundOptions) (adapter.Inbound, error) {
@@ -140,6 +145,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	service.UpdateUsers(userList, userPasswordList)
 	inbound.service = service
 	inbound.userNameList = userNameList
+	inbound.users = append([]option.Hysteria2User(nil), options.Users...)
 	return inbound, nil
 }
 
@@ -156,12 +162,12 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
 	userID, _ := auth.UserFromContext[int](ctx)
-	if userName := h.userNameList[userID]; userName != "" {
-		metadata.User = userName
-		h.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", metadata.Destination)
-	} else {
-		h.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
+	userName := h.userName(userID)
+	if userName == "" {
+		userName = F.ToString(userID)
 	}
+	metadata.User = userName
+	h.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", metadata.Destination)
 	h.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 }
 
@@ -178,12 +184,12 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "inbound packet connection from ", metadata.Source)
 	userID, _ := auth.UserFromContext[int](ctx)
-	if userName := h.userNameList[userID]; userName != "" {
-		metadata.User = userName
-		h.logger.InfoContext(ctx, "[", userName, "] inbound packet connection to ", metadata.Destination)
-	} else {
-		h.logger.InfoContext(ctx, "inbound packet connection to ", metadata.Destination)
+	userName := h.userName(userID)
+	if userName == "" {
+		userName = F.ToString(userID)
 	}
+	metadata.User = userName
+	h.logger.InfoContext(ctx, "[", userName, "] inbound packet connection to ", metadata.Destination)
 	h.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
 }
 
@@ -210,4 +216,92 @@ func (h *Inbound) Close() error {
 		h.tlsConfig,
 		common.PtrOrNil(h.service),
 	)
+}
+
+func (h *Inbound) userName(index int) string {
+	h.userAccess.RLock()
+	defer h.userAccess.RUnlock()
+	if index < 0 || index >= len(h.userNameList) {
+		return ""
+	}
+	return h.userNameList[index]
+}
+
+func (h *Inbound) UpsertRuntimeUsers(users []adapter.RuntimeUser) (int, error) {
+	h.userAccess.Lock()
+	defer h.userAccess.Unlock()
+	existing := append([]option.Hysteria2User(nil), h.users...)
+	indexByPrincipal := make(map[string]int, len(existing))
+	for i, user := range existing {
+		principal := strings.TrimSpace(user.Name)
+		if principal != "" {
+			indexByPrincipal[principal] = i
+		}
+	}
+	applied := 0
+	for _, runtimeUser := range users {
+		principal := strings.TrimSpace(runtimeUser.Principal)
+		if principal == "" {
+			continue
+		}
+		if runtimeUser.Enabled != nil && !*runtimeUser.Enabled {
+			continue
+		}
+		hysteriaUser := option.Hysteria2User{
+			Name:     principal,
+			Password: runtimeUser.Password,
+		}
+		if index, found := indexByPrincipal[principal]; found {
+			existing[index] = hysteriaUser
+		} else {
+			indexByPrincipal[principal] = len(existing)
+			existing = append(existing, hysteriaUser)
+		}
+		applied++
+	}
+	h.replaceUsersLocked(existing)
+	return applied, nil
+}
+
+func (h *Inbound) DeleteRuntimeUsers(principals []string) (int, error) {
+	h.userAccess.Lock()
+	defer h.userAccess.Unlock()
+	if len(principals) == 0 {
+		return 0, nil
+	}
+	deleteSet := make(map[string]struct{}, len(principals))
+	for _, principal := range principals {
+		principal = strings.TrimSpace(principal)
+		if principal != "" {
+			deleteSet[principal] = struct{}{}
+		}
+	}
+	if len(deleteSet) == 0 {
+		return 0, nil
+	}
+	filtered := make([]option.Hysteria2User, 0, len(h.users))
+	deleted := 0
+	for _, user := range h.users {
+		if _, found := deleteSet[strings.TrimSpace(user.Name)]; found {
+			deleted++
+			continue
+		}
+		filtered = append(filtered, user)
+	}
+	h.replaceUsersLocked(filtered)
+	return deleted, nil
+}
+
+func (h *Inbound) replaceUsersLocked(users []option.Hysteria2User) {
+	userList := make([]int, 0, len(users))
+	userNameList := make([]string, 0, len(users))
+	userPasswordList := make([]string, 0, len(users))
+	for index, user := range users {
+		userList = append(userList, index)
+		userNameList = append(userNameList, user.Name)
+		userPasswordList = append(userPasswordList, user.Password)
+	}
+	h.service.UpdateUsers(userList, userPasswordList)
+	h.users = users
+	h.userNameList = userNameList
 }

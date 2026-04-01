@@ -18,6 +18,22 @@ type Inbound interface {
 	Tag() string
 }
 
+type RuntimeUser struct {
+	Principal string `json:"principal"`
+	Name      string `json:"name,omitempty"`
+	UUID      string `json:"uuid,omitempty"`
+	Password  string `json:"password,omitempty"`
+	Flow      string `json:"flow,omitempty"`
+	AlterID   int    `json:"alter_id,omitempty"`
+	Enabled   *bool  `json:"enabled,omitempty"`
+}
+
+type RuntimeUserInbound interface {
+	Inbound
+	UpsertRuntimeUsers(users []RuntimeUser) (int, error)
+	DeleteRuntimeUsers(principals []string) (int, error)
+}
+
 type TCPInjectableInbound interface {
 	Inbound
 	ConnectionHandlerEx

@@ -126,9 +126,8 @@ func (h *RelayInbound) newConnection(ctx context.Context, conn net.Conn, metadat
 	destination := h.destinations[destinationIndex].Name
 	if destination == "" {
 		destination = F.ToString(destinationIndex)
-	} else {
-		metadata.User = destination
 	}
+	metadata.User = destination
 	h.logger.InfoContext(ctx, "[", destination, "] inbound connection to ", metadata.Destination)
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()
@@ -146,9 +145,8 @@ func (h *RelayInbound) newPacketConnection(ctx context.Context, conn N.PacketCon
 	destination := h.destinations[destinationIndex].Name
 	if destination == "" {
 		destination = F.ToString(destinationIndex)
-	} else {
-		metadata.User = destination
 	}
+	metadata.User = destination
 	ctx = log.ContextWithNewID(ctx)
 	h.logger.InfoContext(ctx, "[", destination, "] inbound packet connection from ", metadata.Source)
 	h.logger.InfoContext(ctx, "[", destination, "] inbound packet connection to ", metadata.Destination)

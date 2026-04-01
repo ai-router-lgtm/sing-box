@@ -166,9 +166,8 @@ func (h *MultiInbound) newConnection(ctx context.Context, conn net.Conn, metadat
 	user := h.users[userIndex].Name
 	if user == "" {
 		user = F.ToString(userIndex)
-	} else {
-		metadata.User = user
 	}
+	metadata.User = user
 	h.logger.InfoContext(ctx, "[", user, "] inbound connection to ", metadata.Destination)
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()
@@ -189,9 +188,8 @@ func (h *MultiInbound) newPacketConnection(ctx context.Context, conn N.PacketCon
 	user := h.users[userIndex].Name
 	if user == "" {
 		user = F.ToString(userIndex)
-	} else {
-		metadata.User = user
 	}
+	metadata.User = user
 	ctx = log.ContextWithNewID(ctx)
 	h.logger.InfoContext(ctx, "[", user, "] inbound packet connection from ", metadata.Source)
 	h.logger.InfoContext(ctx, "[", user, "] inbound packet connection to ", metadata.Destination)

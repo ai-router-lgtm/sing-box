@@ -4,6 +4,8 @@ import (
 	"context"
 	"net"
 	"os"
+	"strings"
+	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
@@ -40,6 +42,7 @@ type Inbound struct {
 	fallbackAddr             M.Socksaddr
 	fallbackAddrTLSNextProto map[string]M.Socksaddr
 	transport                adapter.V2RayServerTransport
+	userAccess               sync.RWMutex
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TrojanInboundOptions) (adapter.Inbound, error) {
@@ -189,12 +192,11 @@ func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata ada
 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 		return
 	}
-	user := h.users[userIndex].Name
+	user := h.userName(userIndex)
 	if user == "" {
 		user = F.ToString(userIndex)
-	} else {
-		metadata.User = user
 	}
+	metadata.User = user
 	h.logger.InfoContext(ctx, "[", user, "] inbound connection to ", metadata.Destination)
 	h.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 }
@@ -207,14 +209,103 @@ func (h *Inbound) newPacketConnection(ctx context.Context, conn N.PacketConn, me
 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 		return
 	}
-	user := h.users[userIndex].Name
+	user := h.userName(userIndex)
 	if user == "" {
 		user = F.ToString(userIndex)
-	} else {
-		metadata.User = user
 	}
+	metadata.User = user
 	h.logger.InfoContext(ctx, "[", user, "] inbound packet connection to ", metadata.Destination)
 	h.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
+}
+
+func (h *Inbound) userName(index int) string {
+	h.userAccess.RLock()
+	defer h.userAccess.RUnlock()
+	if index < 0 || index >= len(h.users) {
+		return ""
+	}
+	return h.users[index].Name
+}
+
+func (h *Inbound) UpsertRuntimeUsers(users []adapter.RuntimeUser) (int, error) {
+	h.userAccess.Lock()
+	defer h.userAccess.Unlock()
+	existing := append([]option.TrojanUser(nil), h.users...)
+	indexByPrincipal := make(map[string]int, len(existing))
+	for i, user := range existing {
+		principal := strings.TrimSpace(user.Name)
+		if principal != "" {
+			indexByPrincipal[principal] = i
+		}
+	}
+	applied := 0
+	for _, runtimeUser := range users {
+		principal := strings.TrimSpace(runtimeUser.Principal)
+		if principal == "" {
+			continue
+		}
+		if runtimeUser.Enabled != nil && !*runtimeUser.Enabled {
+			continue
+		}
+		trojanUser := option.TrojanUser{
+			Name:     principal,
+			Password: runtimeUser.Password,
+		}
+		if index, found := indexByPrincipal[principal]; found {
+			existing[index] = trojanUser
+		} else {
+			indexByPrincipal[principal] = len(existing)
+			existing = append(existing, trojanUser)
+		}
+		applied++
+	}
+	err := h.service.UpdateUsers(common.MapIndexed(existing, func(index int, it option.TrojanUser) int {
+		return index
+	}), common.Map(existing, func(it option.TrojanUser) string {
+		return it.Password
+	}))
+	if err != nil {
+		return 0, err
+	}
+	h.users = existing
+	return applied, nil
+}
+
+func (h *Inbound) DeleteRuntimeUsers(principals []string) (int, error) {
+	h.userAccess.Lock()
+	defer h.userAccess.Unlock()
+	if len(principals) == 0 {
+		return 0, nil
+	}
+	deleteSet := make(map[string]struct{}, len(principals))
+	for _, principal := range principals {
+		principal = strings.TrimSpace(principal)
+		if principal != "" {
+			deleteSet[principal] = struct{}{}
+		}
+	}
+	if len(deleteSet) == 0 {
+		return 0, nil
+	}
+	filtered := make([]option.TrojanUser, 0, len(h.users))
+	deleted := 0
+	for _, user := range h.users {
+		if _, found := deleteSet[strings.TrimSpace(user.Name)]; found {
+			deleted++
+			continue
+		}
+		filtered = append(filtered, user)
+	}
+	err := h.service.UpdateUsers(common.MapIndexed(filtered, func(index int, it option.TrojanUser) int {
+		return index
+	}), common.Map(filtered, func(it option.TrojanUser) string {
+		return it.Password
+	}))
+	if err != nil {
+		return 0, err
+	}
+	h.users = filtered
+	return deleted, nil
 }
 
 func (h *Inbound) fallbackConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
