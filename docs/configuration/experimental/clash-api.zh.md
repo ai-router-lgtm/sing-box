@@ -162,3 +162,109 @@ Clash 中的默认模式，默认使用 `Rule`。
 缓存 ID。
 
 如果不为空，配置特定的数据将使用由其键控的单独存储。
+
+### Runtime 控制接口
+
+当启用 `experimental.clash_api.external_controller` 后，sing-box 还会在 `/runtime` 暴露运行时控制接口。
+
+这些接口用于控制面或 node-agent 场景，以便在不 reload 进程的情况下实时更新用户与策略。
+
+#### PUT `/runtime/policy`
+
+应用基于 principal 的策略版本。
+
+请求体：
+
+```json
+{
+  "revision": 1001,
+  "request_id": "policy-req-001",
+  "replace": false,
+  "policies": [
+    {
+      "principal": "user_id:device_id",
+      "max_connections": 3,
+      "up_bps": 1048576,
+      "down_bps": 2097152
+    }
+  ]
+}
+```
+
+响应字段：
+
+- `applied`：该版本是否被接受。
+- `revision`：当前策略版本号。
+- `requestId`：回显请求 ID。
+- `rejected`：当版本过旧时为 `stale_revision`。
+
+#### POST `/runtime/disconnect`
+
+按 principal 或用户维度断开连接。
+
+请求体示例：
+
+```json
+{
+  "principal": "user_id:device_id"
+}
+```
+
+```json
+{
+  "user_id": "user_id"
+}
+```
+
+仅传 `user_id`（不带 `device_id`）时，会同时断开 `user_id` 与 `user_id:*`。
+
+#### GET `/runtime/stats/snapshot`
+
+返回总流量和 principal 维度快照：
+
+- `upload_total`
+- `download_total`
+- `principal_stats[]`（每个 principal 的活动连接与流量）
+
+#### PUT `/runtime/users`
+
+对指定入站执行运行时用户增删改。
+
+请求体：
+
+```json
+{
+  "revision": 2001,
+  "request_id": "req-001",
+  "operations": [
+    {
+      "inbound": "vless-in",
+      "upsert": [
+        {
+          "principal": "user_id:device_id",
+          "uuid": "00000000-0000-0000-0000-000000000000",
+          "enabled": true
+        }
+      ],
+      "delete": [
+        "old_user:old_device"
+      ]
+    }
+  ]
+}
+```
+
+当前支持运行时用户更新的入站包括 VLESS、VMess、Trojan、TUIC、Hysteria2。
+
+`upsert` 除 `principal` 外，也支持 `name` 作为 `principal` 的兼容别名。
+
+响应字段：
+
+- `applied`：是否已应用。
+- `revision`：当前用户版本号。
+- `rejected`：当版本过旧时为 `stale_revision`。
+- `idempotent`：重复 `request_id` 被忽略时为 `true`。
+
+#### DELETE `/runtime/users/{principal}?inbound={tag}`
+
+从指定入站删除一个运行时用户。

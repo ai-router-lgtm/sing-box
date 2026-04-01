@@ -164,3 +164,109 @@ Cache file path, `cache.db` will be used if empty.
 Identifier in cache file.
 
 If not empty, configuration specified data will use a separate store keyed by it.
+
+### Runtime Control API
+
+When `experimental.clash_api.external_controller` is enabled, sing-box also exposes runtime control endpoints under `/runtime`.
+
+These endpoints are designed for control-plane and node-agent integrations that need real-time user/policy updates without full process reload.
+
+#### PUT `/runtime/policy`
+
+Apply principal-based policy revision.
+
+Request body:
+
+```json
+{
+  "revision": 1001,
+  "request_id": "policy-req-001",
+  "replace": false,
+  "policies": [
+    {
+      "principal": "user_id:device_id",
+      "max_connections": 3,
+      "up_bps": 1048576,
+      "down_bps": 2097152
+    }
+  ]
+}
+```
+
+Response fields:
+
+- `applied`: whether this revision is accepted.
+- `revision`: current policy revision.
+- `requestId`: echoed request id.
+- `rejected`: `stale_revision` when revision is older than current revision.
+
+#### POST `/runtime/disconnect`
+
+Disconnect by principal or by user id.
+
+Request body examples:
+
+```json
+{
+  "principal": "user_id:device_id"
+}
+```
+
+```json
+{
+  "user_id": "user_id"
+}
+```
+
+`user_id` without `device_id` disconnects both `user_id` and `user_id:*`.
+
+#### GET `/runtime/stats/snapshot`
+
+Return traffic totals and principal snapshots:
+
+- `upload_total`
+- `download_total`
+- `principal_stats[]` (active connections and traffic per principal)
+
+#### PUT `/runtime/users`
+
+Upsert/delete runtime users on specific inbounds.
+
+Request body:
+
+```json
+{
+  "revision": 2001,
+  "request_id": "req-001",
+  "operations": [
+    {
+      "inbound": "vless-in",
+      "upsert": [
+        {
+          "principal": "user_id:device_id",
+          "uuid": "00000000-0000-0000-0000-000000000000",
+          "enabled": true
+        }
+      ],
+      "delete": [
+        "old_user:old_device"
+      ]
+    }
+  ]
+}
+```
+
+Supported runtime user inbounds include VLESS, VMess, Trojan, TUIC and Hysteria2.
+
+`upsert` accepts `principal` and also accepts `name` as a compatibility alias of `principal`.
+
+Response fields:
+
+- `applied`: whether operation is applied.
+- `revision`: current users revision.
+- `rejected`: `stale_revision` when revision is stale.
+- `idempotent`: `true` when duplicated `request_id` is ignored.
+
+#### DELETE `/runtime/users/{principal}?inbound={tag}`
+
+Delete one runtime user from a specific inbound.
