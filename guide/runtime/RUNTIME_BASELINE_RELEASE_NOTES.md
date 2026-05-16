@@ -37,6 +37,16 @@ Common response semantics:
 - `rejected`: rejection reason, currently `stale_revision`.
 - `idempotent`: present for duplicate users requests.
 
+### runtime stats snapshot
+
+`GET /runtime/stats/snapshot` returns:
+
+- `upload_total` / `download_total`: global cumulative traffic totals.
+- `principal_stats[].upload` / `principal_stats[].download`: cumulative traffic totals per principal.
+- `principal_stats[].active`: current active connection count per principal.
+
+The `principal_stats` traffic fields are cumulative values and are no longer computed as the sum of currently active connections.
+
 ## Compatibility
 
 ### runtime users upsert alias

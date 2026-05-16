@@ -308,6 +308,60 @@ func TestRuntimePolicyRequestIDAndStale(t *testing.T) {
 	}
 }
 
+func TestRuntimeStatsSnapshotUsesPrincipalCumulativeTotals(t *testing.T) {
+	trafficManager, server := newRuntimeTestServer(newFakeInboundManager())
+	defer server.Close()
+
+	tracker := newFakeTracker("u1:d1")
+	tracker.metadata.Upload.Store(1)
+	tracker.metadata.Download.Store(2)
+	trafficManager.Join(tracker)
+	trafficManager.PushUploaded(100)
+	trafficManager.PushDownloaded(50)
+	trafficManager.PushPrincipalUploaded("u1:d1", 100)
+	trafficManager.PushPrincipalDownloaded("u1:d1", 50)
+
+	resp, err := http.Get(server.URL + "/stats/snapshot")
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: %d", resp.StatusCode)
+	}
+
+	var body struct {
+		UploadTotal    int64 `json:"upload_total"`
+		DownloadTotal  int64 `json:"download_total"`
+		PrincipalStats []struct {
+			Principal string `json:"principal"`
+			Active    int    `json:"active"`
+			Upload    int64  `json:"upload"`
+			Download  int64  `json:"download"`
+		} `json:"principal_stats"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.UploadTotal != 100 || body.DownloadTotal != 50 {
+		t.Fatalf("unexpected totals: %+v", body)
+	}
+
+	for _, principalStat := range body.PrincipalStats {
+		if principalStat.Principal != "u1:d1" {
+			continue
+		}
+		if principalStat.Active != 1 {
+			t.Fatalf("unexpected active count: %+v", principalStat)
+		}
+		if principalStat.Upload != 100 || principalStat.Download != 50 {
+			t.Fatalf("expected principal cumulative totals, got %+v", principalStat)
+		}
+		return
+	}
+	t.Fatal("expected u1:d1 principal stats in snapshot")
+}
+
 var _ adapter.RuntimeUserInbound = (*fakeRuntimeInbound)(nil)
 var _ adapter.InboundManager = (*fakeInboundManager)(nil)
 var _ trafficontrol.Tracker = (*fakeTracker)(nil)

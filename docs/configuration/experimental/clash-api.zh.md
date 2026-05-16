@@ -224,7 +224,13 @@ Clash 中的默认模式，默认使用 `Rule`。
 
 - `upload_total`
 - `download_total`
-- `principal_stats[]`（每个 principal 的活动连接与流量）
+- `principal_stats[]`（每个 principal 的活动连接与累计流量）
+
+其中：
+
+- `upload_total` / `download_total` 为全局累计值。
+- `principal_stats[].upload` / `principal_stats[].download` 为该 principal 的累计值，单调不减。
+- `principal_stats[].active` 为当前活跃连接数，实时变化。
 
 #### PUT `/runtime/users`
 

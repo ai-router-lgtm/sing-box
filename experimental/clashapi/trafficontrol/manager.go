@@ -2,6 +2,7 @@ package trafficontrol
 
 import (
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,6 +37,12 @@ type ConnectionEvent struct {
 
 const closedConnectionsLimit = 1000
 
+const (
+	principalCounterTTL           = 30 * 24 * time.Hour
+	principalCounterMaxEntries    = 2048
+	principalCounterPruneInterval = time.Minute
+)
+
 type PrincipalPolicy struct {
 	Principal      string `json:"principal"`
 	MaxConnections int    `json:"max_connections"`
@@ -53,6 +60,12 @@ type PrincipalSnapshot struct {
 	DownBPS        int64  `json:"down_bps,omitempty"`
 }
 
+type principalCounter struct {
+	uploadTotal   atomic.Int64
+	downloadTotal atomic.Int64
+	lastSeenUnix  atomic.Int64
+}
+
 type Manager struct {
 	uploadTotal   atomic.Int64
 	downloadTotal atomic.Int64
@@ -66,12 +79,21 @@ type Manager struct {
 	policies       map[string]PrincipalPolicy
 	policyRevision atomic.Int64
 
+	limitersAccess sync.Mutex
+	limiters       map[string]*principalRateLimiter
+
+	principalCountersAccess sync.RWMutex
+	principalCounters       map[string]*principalCounter
+	lastPrincipalPruneUnix  atomic.Int64
+
 	eventSubscriber *observable.Subscriber[ConnectionEvent]
 }
 
 func NewManager() *Manager {
 	return &Manager{
-		policies: make(map[string]PrincipalPolicy),
+		policies:          make(map[string]PrincipalPolicy),
+		limiters:          make(map[string]*principalRateLimiter),
+		principalCounters: make(map[string]*principalCounter),
 	}
 }
 
@@ -127,6 +149,36 @@ func (m *Manager) PushUploaded(size int64) {
 
 func (m *Manager) PushDownloaded(size int64) {
 	m.downloadTotal.Add(size)
+}
+
+func (m *Manager) PushPrincipalUploaded(principal string, size int64) {
+	if size <= 0 {
+		return
+	}
+	principal = strings.TrimSpace(principal)
+	if principal == "" {
+		return
+	}
+	now := time.Now()
+	counter := m.loadOrStorePrincipalCounter(principal)
+	counter.uploadTotal.Add(size)
+	counter.lastSeenUnix.Store(now.Unix())
+	m.maybePrunePrincipalCounters(now)
+}
+
+func (m *Manager) PushPrincipalDownloaded(principal string, size int64) {
+	if size <= 0 {
+		return
+	}
+	principal = strings.TrimSpace(principal)
+	if principal == "" {
+		return
+	}
+	now := time.Now()
+	counter := m.loadOrStorePrincipalCounter(principal)
+	counter.downloadTotal.Add(size)
+	counter.lastSeenUnix.Store(now.Unix())
+	m.maybePrunePrincipalCounters(now)
 }
 
 func (m *Manager) Total() (up int64, down int64) {
@@ -192,6 +244,9 @@ func (m *Manager) Snapshot() *Snapshot {
 func (m *Manager) ResetStatistic() {
 	m.uploadTotal.Store(0)
 	m.downloadTotal.Store(0)
+	m.principalCountersAccess.Lock()
+	m.principalCounters = make(map[string]*principalCounter)
+	m.principalCountersAccess.Unlock()
 }
 
 func (m *Manager) CurrentPolicyRevision() int64 {
@@ -272,7 +327,18 @@ func (m *Manager) DisconnectUser(userID string) int {
 }
 
 func (m *Manager) SnapshotByPrincipal() []PrincipalSnapshot {
+	m.maybePrunePrincipalCounters(time.Now())
 	snapshotMap := make(map[string]PrincipalSnapshot)
+	m.principalCountersAccess.RLock()
+	for principal, counter := range m.principalCounters {
+		snapshotMap[principal] = PrincipalSnapshot{
+			Principal: principal,
+			Upload:    counter.uploadTotal.Load(),
+			Download:  counter.downloadTotal.Load(),
+		}
+	}
+	m.principalCountersAccess.RUnlock()
+
 	m.connections.Range(func(_ uuid.UUID, value Tracker) bool {
 		metadata := value.Metadata()
 		principal := metadataPrincipal(metadata)
@@ -282,8 +348,6 @@ func (m *Manager) SnapshotByPrincipal() []PrincipalSnapshot {
 		current := snapshotMap[principal]
 		current.Principal = principal
 		current.Active++
-		current.Upload += metadata.Upload.Load()
-		current.Download += metadata.Download.Load()
 		snapshotMap[principal] = current
 		return true
 	})
@@ -321,14 +385,25 @@ func (m *Manager) PolicyForPrincipal(principal string) (PrincipalPolicy, bool) {
 		return PrincipalPolicy{}, false
 	}
 	m.policiesAccess.RLock()
-	policy, ok := m.policyForPrincipalLocked(principal)
+	policy, _, ok := m.policyForPrincipalLocked(principal)
 	m.policiesAccess.RUnlock()
 	return policy, ok
 }
 
+func (m *Manager) PolicyForPrincipalResolved(principal string) (PrincipalPolicy, string, bool) {
+	principal = strings.TrimSpace(principal)
+	if principal == "" {
+		return PrincipalPolicy{}, "", false
+	}
+	m.policiesAccess.RLock()
+	policy, policyKey, ok := m.policyForPrincipalLocked(principal)
+	m.policiesAccess.RUnlock()
+	return policy, policyKey, ok
+}
+
 func (m *Manager) allowPrincipalJoin(principal string) bool {
 	m.policiesAccess.RLock()
-	policy, ok := m.policyForPrincipalLocked(principal)
+	policy, _, ok := m.policyForPrincipalLocked(principal)
 	m.policiesAccess.RUnlock()
 	if !ok || policy.MaxConnections <= 0 {
 		return true
@@ -351,16 +426,141 @@ func metadataPrincipal(metadata *TrackerMetadata) string {
 	return strings.TrimSpace(metadata.Metadata.User)
 }
 
-func (m *Manager) policyForPrincipalLocked(principal string) (PrincipalPolicy, bool) {
-	if policy, found := m.policies[principal]; found {
-		return policy, true
+func (m *Manager) loadOrStorePrincipalCounter(principal string) *principalCounter {
+	m.principalCountersAccess.RLock()
+	counter, loaded := m.principalCounters[principal]
+	m.principalCountersAccess.RUnlock()
+	if loaded {
+		return counter
 	}
-	if userID := principalUserID(principal); userID != "" {
-		if policy, found := m.policies[userID+":*"]; found {
-			return policy, true
+
+	m.principalCountersAccess.Lock()
+	defer m.principalCountersAccess.Unlock()
+	counter, loaded = m.principalCounters[principal]
+	if loaded {
+		return counter
+	}
+	counter = &principalCounter{}
+	counter.lastSeenUnix.Store(time.Now().Unix())
+	m.principalCounters[principal] = counter
+	return counter
+}
+
+func (m *Manager) maybePrunePrincipalCounters(now time.Time) {
+	lastPruneUnix := m.lastPrincipalPruneUnix.Load()
+	if lastPruneUnix > 0 && now.Sub(time.Unix(lastPruneUnix, 0)) < principalCounterPruneInterval {
+		return
+	}
+	if !m.lastPrincipalPruneUnix.CompareAndSwap(lastPruneUnix, now.Unix()) {
+		return
+	}
+
+	activePrincipals := make(map[string]struct{})
+	m.connections.Range(func(_ uuid.UUID, value Tracker) bool {
+		principal := metadataPrincipal(value.Metadata())
+		if principal != "" {
+			activePrincipals[principal] = struct{}{}
+		}
+		return true
+	})
+
+	type pruneCandidate struct {
+		principal string
+		lastSeen  int64
+	}
+	var evictionCandidates []pruneCandidate
+
+	m.principalCountersAccess.Lock()
+	for principal, counter := range m.principalCounters {
+		if _, active := activePrincipals[principal]; active {
+			continue
+		}
+		lastSeen := counter.lastSeenUnix.Load()
+		if lastSeen <= 0 {
+			lastSeen = now.Unix()
+		}
+		lastSeenTime := time.Unix(lastSeen, 0)
+		if now.Sub(lastSeenTime) >= principalCounterTTL {
+			delete(m.principalCounters, principal)
+			continue
+		}
+		evictionCandidates = append(evictionCandidates, pruneCandidate{principal: principal, lastSeen: lastSeen})
+	}
+	if len(m.principalCounters) > principalCounterMaxEntries && len(evictionCandidates) > 0 {
+		sort.Slice(evictionCandidates, func(i, j int) bool {
+			return evictionCandidates[i].lastSeen < evictionCandidates[j].lastSeen
+		})
+		for _, candidate := range evictionCandidates {
+			if len(m.principalCounters) <= principalCounterMaxEntries {
+				break
+			}
+			delete(m.principalCounters, candidate.principal)
 		}
 	}
-	return PrincipalPolicy{}, false
+	m.principalCountersAccess.Unlock()
+}
+
+func (m *Manager) policyForPrincipalLocked(principal string) (PrincipalPolicy, string, bool) {
+	if policy, found := m.policies[principal]; found {
+		return policy, principal, true
+	}
+	if userID := principalUserID(principal); userID != "" {
+		wildcardKey := userID + ":*"
+		if policy, found := m.policies[wildcardKey]; found {
+			return policy, wildcardKey, true
+		}
+	}
+	return PrincipalPolicy{}, "", false
+}
+
+type principalRateLimiter struct {
+	nextUpload   time.Time
+	nextDownload time.Time
+}
+
+func (m *Manager) WaitPrincipalRateLimit(policyKey string, direction trafficDirection, bytes int64, bytesPerSecond int64) {
+	if strings.TrimSpace(policyKey) == "" || bytes <= 0 || bytesPerSecond <= 0 {
+		return
+	}
+	duration := time.Duration(float64(bytes) / float64(bytesPerSecond) * float64(time.Second))
+	if duration <= 0 {
+		return
+	}
+
+	now := time.Now()
+	var sleepUntil time.Time
+
+	m.limitersAccess.Lock()
+	limiter, found := m.limiters[policyKey]
+	if !found {
+		limiter = &principalRateLimiter{}
+		m.limiters[policyKey] = limiter
+	}
+
+	switch direction {
+	case directionUpload:
+		start := now
+		if limiter.nextUpload.After(start) {
+			start = limiter.nextUpload
+		}
+		sleepUntil = start.Add(duration)
+		limiter.nextUpload = sleepUntil
+	case directionDownload:
+		start := now
+		if limiter.nextDownload.After(start) {
+			start = limiter.nextDownload
+		}
+		sleepUntil = start.Add(duration)
+		limiter.nextDownload = sleepUntil
+	default:
+		m.limitersAccess.Unlock()
+		return
+	}
+	m.limitersAccess.Unlock()
+
+	if sleep := time.Until(sleepUntil); sleep > 0 {
+		time.Sleep(sleep)
+	}
 }
 
 func principalUserID(principal string) string {

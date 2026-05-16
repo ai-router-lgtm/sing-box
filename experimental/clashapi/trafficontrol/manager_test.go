@@ -1,8 +1,10 @@
 package trafficontrol
 
 import (
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gofrs/uuid/v5"
 	"github.com/sagernet/sing-box/adapter"
@@ -33,6 +35,15 @@ func (t *fakeTracker) Metadata() *TrackerMetadata {
 
 func (t *fakeTracker) Close() error {
 	t.closed.Store(true)
+	return nil
+}
+
+func findPrincipalSnapshot(snapshots []PrincipalSnapshot, principal string) *PrincipalSnapshot {
+	for i := range snapshots {
+		if snapshots[i].Principal == principal {
+			return &snapshots[i]
+		}
+	}
 	return nil
 }
 
@@ -186,5 +197,199 @@ func TestSnapshotByPrincipalApplyWildcardPolicy(t *testing.T) {
 	}
 	if principalSnapshot.MaxConnections != 3 || principalSnapshot.UpBPS != 333 || principalSnapshot.DownBPS != 666 {
 		t.Fatalf("unexpected wildcard-applied snapshot: %+v", *principalSnapshot)
+	}
+}
+
+func TestPolicyForPrincipalResolvedReturnsWildcardKey(t *testing.T) {
+	manager := NewManager()
+	ok := manager.ApplyPolicyRevision(1, true, []PrincipalPolicy{
+		{
+			Principal: "u3:*",
+			UpBPS:     1024,
+		},
+	})
+	if !ok {
+		t.Fatal("expected policy revision applied")
+	}
+
+	policy, key, found := manager.PolicyForPrincipalResolved("u3:d1")
+	if !found {
+		t.Fatal("expected wildcard policy resolved")
+	}
+	if key != "u3:*" {
+		t.Fatalf("unexpected policy key: %q", key)
+	}
+	if policy.UpBPS != 1024 {
+		t.Fatalf("unexpected policy value: %+v", policy)
+	}
+}
+
+func TestDynamicRateLimitAggregatesByWildcardPolicyKey(t *testing.T) {
+	manager := NewManager()
+	ok := manager.ApplyPolicyRevision(1, true, []PrincipalPolicy{
+		{
+			Principal: "u4:*",
+			UpBPS:     1000,
+		},
+	})
+	if !ok {
+		t.Fatal("expected policy revision applied")
+	}
+
+	count1 := buildDynamicRateLimitCountFunc(manager, "u4:d1", directionUpload)
+	count2 := buildDynamicRateLimitCountFunc(manager, "u4:d2", directionUpload)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	start := time.Now()
+	go func() {
+		defer wg.Done()
+		count1(1000)
+	}()
+	go func() {
+		defer wg.Done()
+		count2(1000)
+	}()
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	// 1000B/s with 2*1000B shared by same wildcard key should serialize to around 2s.
+	if elapsed < 1800*time.Millisecond {
+		t.Fatalf("expected aggregated rate limit to serialize shared principal traffic, elapsed=%s", elapsed)
+	}
+}
+
+func TestSnapshotByPrincipalMonotonicCounters(t *testing.T) {
+	manager := NewManager()
+	manager.PushPrincipalUploaded("u1:d1", 10)
+	manager.PushPrincipalDownloaded("u1:d1", 5)
+
+	first := findPrincipalSnapshot(manager.SnapshotByPrincipal(), "u1:d1")
+	if first == nil {
+		t.Fatal("expected principal snapshot after first push")
+	}
+	if first.Upload != 10 || first.Download != 5 {
+		t.Fatalf("unexpected first snapshot: %+v", *first)
+	}
+
+	manager.PushPrincipalUploaded("u1:d1", 7)
+	manager.PushPrincipalDownloaded("u1:d1", 11)
+	second := findPrincipalSnapshot(manager.SnapshotByPrincipal(), "u1:d1")
+	if second == nil {
+		t.Fatal("expected principal snapshot after second push")
+	}
+	if second.Upload != 17 || second.Download != 16 {
+		t.Fatalf("unexpected second snapshot: %+v", *second)
+	}
+	if second.Upload < first.Upload || second.Download < first.Download {
+		t.Fatalf("expected monotonic counters, first=%+v second=%+v", *first, *second)
+	}
+}
+
+func TestSnapshotByPrincipalReconnectKeepsTotals(t *testing.T) {
+	manager := NewManager()
+	tracker := newFakeTracker("u1:d1")
+	manager.Join(tracker)
+	manager.PushPrincipalUploaded("u1:d1", 42)
+	manager.PushPrincipalDownloaded("u1:d1", 24)
+
+	connected := findPrincipalSnapshot(manager.SnapshotByPrincipal(), "u1:d1")
+	if connected == nil {
+		t.Fatal("expected connected principal snapshot")
+	}
+	if connected.Active != 1 || connected.Upload != 42 || connected.Download != 24 {
+		t.Fatalf("unexpected connected snapshot: %+v", *connected)
+	}
+
+	manager.Leave(tracker)
+	disconnected := findPrincipalSnapshot(manager.SnapshotByPrincipal(), "u1:d1")
+	if disconnected == nil {
+		t.Fatal("expected disconnected principal snapshot")
+	}
+	if disconnected.Active != 0 {
+		t.Fatalf("expected active=0 after disconnect, got %+v", *disconnected)
+	}
+	if disconnected.Upload != 42 || disconnected.Download != 24 {
+		t.Fatalf("expected totals preserved after disconnect, got %+v", *disconnected)
+	}
+
+	reconnected := newFakeTracker("u1:d1")
+	manager.Join(reconnected)
+	manager.PushPrincipalUploaded("u1:d1", 8)
+	manager.PushPrincipalDownloaded("u1:d1", 6)
+	afterReconnect := findPrincipalSnapshot(manager.SnapshotByPrincipal(), "u1:d1")
+	if afterReconnect == nil {
+		t.Fatal("expected principal snapshot after reconnect")
+	}
+	if afterReconnect.Active != 1 || afterReconnect.Upload != 50 || afterReconnect.Download != 30 {
+		t.Fatalf("unexpected snapshot after reconnect: %+v", *afterReconnect)
+	}
+}
+
+func TestPrincipalCounterConcurrentAccumulation(t *testing.T) {
+	manager := NewManager()
+	principals := []string{"u1:d1", "u1:d2", "u2:d1"}
+	const iterations = 200
+
+	var wg sync.WaitGroup
+	for _, principal := range principals {
+		principal := principal
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				manager.PushUploaded(3)
+				manager.PushDownloaded(5)
+				manager.PushPrincipalUploaded(principal, 3)
+				manager.PushPrincipalDownloaded(principal, 5)
+			}
+		}()
+	}
+	wg.Wait()
+
+	uploadTotal, downloadTotal := manager.Total()
+	expectedUpload := int64(len(principals) * iterations * 3)
+	expectedDownload := int64(len(principals) * iterations * 5)
+	if uploadTotal != expectedUpload || downloadTotal != expectedDownload {
+		t.Fatalf("unexpected global totals: upload=%d download=%d", uploadTotal, downloadTotal)
+	}
+
+	var principalUpload int64
+	var principalDownload int64
+	for _, snapshot := range manager.SnapshotByPrincipal() {
+		principalUpload += snapshot.Upload
+		principalDownload += snapshot.Download
+	}
+	if principalUpload != uploadTotal || principalDownload != downloadTotal {
+		t.Fatalf("principal totals do not match globals: principalUpload=%d globalUpload=%d principalDownload=%d globalDownload=%d", principalUpload, uploadTotal, principalDownload, downloadTotal)
+	}
+}
+
+func TestPrincipalCounterTTLPrune(t *testing.T) {
+	manager := NewManager()
+	manager.PushPrincipalUploaded("stale:d1", 10)
+	manager.PushPrincipalUploaded("fresh:d1", 20)
+
+	manager.principalCountersAccess.RLock()
+	staleCounter := manager.principalCounters["stale:d1"]
+	freshCounter := manager.principalCounters["fresh:d1"]
+	manager.principalCountersAccess.RUnlock()
+	if staleCounter == nil || freshCounter == nil {
+		t.Fatal("expected principal counters present")
+	}
+
+	now := time.Now()
+	staleCounter.lastSeenUnix.Store(now.Add(-principalCounterTTL - time.Hour).Unix())
+	freshCounter.lastSeenUnix.Store(now.Unix())
+	manager.lastPrincipalPruneUnix.Store(0)
+	manager.maybePrunePrincipalCounters(now)
+
+	snapshots := manager.SnapshotByPrincipal()
+	if findPrincipalSnapshot(snapshots, "stale:d1") != nil {
+		t.Fatal("expected stale principal removed by TTL prune")
+	}
+	fresh := findPrincipalSnapshot(snapshots, "fresh:d1")
+	if fresh == nil || fresh.Upload != 20 {
+		t.Fatalf("expected fresh principal preserved, got %+v", fresh)
 	}
 }

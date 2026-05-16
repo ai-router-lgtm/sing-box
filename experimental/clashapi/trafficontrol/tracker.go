@@ -165,10 +165,16 @@ func NewTCPTracker(conn net.Conn, manager *Manager, metadata adapter.InboundCont
 	readCounters = append(readCounters, func(n int64) {
 		upload.Add(n)
 		manager.PushUploaded(n)
+		if principal != "" {
+			manager.PushPrincipalUploaded(principal, n)
+		}
 	})
 	writeCounters = append(writeCounters, func(n int64) {
 		download.Add(n)
 		manager.PushDownloaded(n)
+		if principal != "" {
+			manager.PushPrincipalDownloaded(principal, n)
+		}
 	})
 	tracker := &TCPConn{
 		ExtendedConn: bufio.NewCounterConn(conn, readCounters, writeCounters),
@@ -255,10 +261,16 @@ func NewUDPTracker(conn N.PacketConn, manager *Manager, metadata adapter.Inbound
 	readCounters = append(readCounters, func(n int64) {
 		upload.Add(n)
 		manager.PushUploaded(n)
+		if principal != "" {
+			manager.PushPrincipalUploaded(principal, n)
+		}
 	})
 	writeCounters = append(writeCounters, func(n int64) {
 		download.Add(n)
 		manager.PushDownloaded(n)
+		if principal != "" {
+			manager.PushPrincipalDownloaded(principal, n)
+		}
 	})
 	trackerConn := &UDPConn{
 		PacketConn: bufio.NewCounterPacketConn(conn, readCounters, writeCounters),
@@ -284,7 +296,7 @@ func buildDynamicRateLimitCountFunc(manager *Manager, principal string, directio
 		if n <= 0 {
 			return
 		}
-		policy, ok := manager.PolicyForPrincipal(principal)
+		policy, policyKey, ok := manager.PolicyForPrincipalResolved(principal)
 		if !ok {
 			return
 		}
@@ -300,9 +312,6 @@ func buildDynamicRateLimitCountFunc(manager *Manager, principal string, directio
 		if bytesPerSecond <= 0 {
 			return
 		}
-		delay := time.Duration(float64(n) / float64(bytesPerSecond) * float64(time.Second))
-		if delay > 0 {
-			time.Sleep(delay)
-		}
+		manager.WaitPrincipalRateLimit(policyKey, direction, n, bytesPerSecond)
 	}
 }
