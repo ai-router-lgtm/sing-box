@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+      - testing
+  workflow_dispatch:
 
 jobs:
   build-and-push:
@@ -33,6 +35,8 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/ai-router-lgtm/sing-box:latest
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/ai-router-lgtm/sing-box:${{ github.ref_name == 'main' && 'latest' || 'testing-latest' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
