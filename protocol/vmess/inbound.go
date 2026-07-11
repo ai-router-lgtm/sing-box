@@ -226,6 +226,20 @@ func (h *Inbound) userName(index int) string {
 	return user
 }
 
+func (h *Inbound) SnapshotRuntimeUsers() []adapter.RuntimeUser {
+	h.userAccess.RLock()
+	defer h.userAccess.RUnlock()
+	users := make([]adapter.RuntimeUser, 0, len(h.users))
+	for _, user := range h.users {
+		users = append(users, adapter.RuntimeUser{
+			Principal: user.Name,
+			UUID:      user.UUID,
+			AlterID:   user.AlterId,
+		})
+	}
+	return users
+}
+
 func (h *Inbound) UpsertRuntimeUsers(users []adapter.RuntimeUser) (int, error) {
 	h.userAccess.Lock()
 	defer h.userAccess.Unlock()

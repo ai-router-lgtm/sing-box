@@ -30,13 +30,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Generate image metadata
+        id: metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/ai-router-lgtm/sing-box
+          tags: |
+            type=sha,prefix=sha-,format=long
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=testing-latest,enable=${{ github.ref == 'refs/heads/testing' }}
+
       - name: Build and push Docker image
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: |
-            ghcr.io/ai-router-lgtm/sing-box:${{ github.ref_name == 'main' && 'latest' || 'testing-latest' }}
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Report immutable image digest
+        run: echo "ghcr.io/ai-router-lgtm/sing-box@${{ steps.build.outputs.digest }}"
