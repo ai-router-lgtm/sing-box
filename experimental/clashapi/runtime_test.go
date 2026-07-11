@@ -515,6 +515,11 @@ func TestRuntimePolicySnapshotMatchesStatusDigest(t *testing.T) {
 }
 
 func TestRuntimeDigestFixtures(t *testing.T) {
+	emptyPolicyDigest := digestPolicies(nil)
+	if emptyPolicyDigest != "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945" {
+		t.Fatalf("empty policy digest must use canonical JSON array: %s", emptyPolicyDigest)
+	}
+
 	users := map[string]adapter.RuntimeUser{
 		"u1:d1": {
 			Principal: "u1:d1",

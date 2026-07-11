@@ -682,7 +682,7 @@ func canonicalRuntimeUsers(inboundTag string, users map[string]adapter.RuntimeUs
 }
 
 func digestPolicies(policies []trafficontrol.PrincipalPolicy) string {
-	copyPolicies := append([]trafficontrol.PrincipalPolicy(nil), policies...)
+	copyPolicies := append([]trafficontrol.PrincipalPolicy{}, policies...)
 	for index := range copyPolicies {
 		copyPolicies[index].Principal = strings.TrimSpace(copyPolicies[index].Principal)
 	}
