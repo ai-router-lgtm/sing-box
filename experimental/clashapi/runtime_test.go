@@ -127,6 +127,8 @@ func newRuntimeTestServer(inboundManager adapter.InboundManager) (*trafficontrol
 }
 
 func TestRuntimeUsersBadRequest(t *testing.T) {
+	t.Parallel()
+
 	_, server := newRuntimeTestServer(newFakeInboundManager())
 	defer server.Close()
 
@@ -143,6 +145,8 @@ func TestRuntimeUsersBadRequest(t *testing.T) {
 }
 
 func TestRuntimeUsersInboundNotFound(t *testing.T) {
+	t.Parallel()
+
 	_, server := newRuntimeTestServer(newFakeInboundManager())
 	defer server.Close()
 
@@ -160,6 +164,8 @@ func TestRuntimeUsersInboundNotFound(t *testing.T) {
 }
 
 func TestRuntimeUsersRevisionAndIdempotent(t *testing.T) {
+	t.Parallel()
+
 	inbound := &fakeRuntimeInbound{tag: "vless-in"}
 	_, server := newRuntimeTestServer(newFakeInboundManager(inbound))
 	defer server.Close()
@@ -218,6 +224,8 @@ func TestRuntimeUsersRevisionAndIdempotent(t *testing.T) {
 }
 
 func TestRuntimeUsersUpsertNameAlias(t *testing.T) {
+	t.Parallel()
+
 	inbound := &fakeRuntimeInbound{tag: "vless-in"}
 	_, server := newRuntimeTestServer(newFakeInboundManager(inbound))
 	defer server.Close()
@@ -242,6 +250,8 @@ func TestRuntimeUsersUpsertNameAlias(t *testing.T) {
 }
 
 func TestRuntimeUsersReplaceManagedPreservesStaticUsersAndStableDigest(t *testing.T) {
+	t.Parallel()
+
 	staticUUID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 	inbound := &fakeRuntimeInbound{
 		tag: "vless-in",
@@ -337,6 +347,8 @@ func TestRuntimeUsersReplaceManagedPreservesStaticUsersAndStableDigest(t *testin
 }
 
 func TestRuntimeDisconnectBatchIsIdempotent(t *testing.T) {
+	t.Parallel()
+
 	trafficManager, server := newRuntimeTestServer(newFakeInboundManager())
 	defer server.Close()
 
@@ -379,6 +391,8 @@ func TestRuntimeDisconnectBatchIsIdempotent(t *testing.T) {
 }
 
 func TestRuntimeDisconnectRejectsMoreThanMaximumSelectors(t *testing.T) {
+	t.Parallel()
+
 	_, server := newRuntimeTestServer(newFakeInboundManager())
 	defer server.Close()
 	principals := make([]string, maxRuntimeDisconnectSelectors+1)
@@ -396,6 +410,8 @@ func TestRuntimeDisconnectRejectsMoreThanMaximumSelectors(t *testing.T) {
 }
 
 func TestRuntimeDisconnectByUserIDIncludesWildcard(t *testing.T) {
+	t.Parallel()
+
 	trafficManager, server := newRuntimeTestServer(newFakeInboundManager())
 	defer server.Close()
 
@@ -427,6 +443,8 @@ func TestRuntimeDisconnectByUserIDIncludesWildcard(t *testing.T) {
 }
 
 func TestRuntimePolicyRequestIDAndStale(t *testing.T) {
+	t.Parallel()
+
 	_, server := newRuntimeTestServer(newFakeInboundManager())
 	defer server.Close()
 
@@ -473,6 +491,8 @@ func TestRuntimePolicyRequestIDAndStale(t *testing.T) {
 }
 
 func TestRuntimePolicySnapshotMatchesStatusDigest(t *testing.T) {
+	t.Parallel()
+
 	_, server := newRuntimeTestServer(newFakeInboundManager())
 	defer server.Close()
 	policyPayload := `{"revision":12,"request_id":"policy-snapshot","replace":true,"policies":[{"principal":"u2:*","up_bps":200},{"principal":"u1:d1","down_bps":100}]}`
@@ -515,6 +535,8 @@ func TestRuntimePolicySnapshotMatchesStatusDigest(t *testing.T) {
 }
 
 func TestRuntimeDigestFixtures(t *testing.T) {
+	t.Parallel()
+
 	emptyPolicyDigest := digestPolicies(nil)
 	if emptyPolicyDigest != "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945" {
 		t.Fatalf("empty policy digest must use canonical JSON array: %s", emptyPolicyDigest)
@@ -543,6 +565,8 @@ func TestRuntimeDigestFixtures(t *testing.T) {
 }
 
 func TestRuntimeStatsSnapshotUsesPrincipalCumulativeTotals(t *testing.T) {
+	t.Parallel()
+
 	trafficManager, server := newRuntimeTestServer(newFakeInboundManager())
 	defer server.Close()
 
@@ -643,6 +667,8 @@ func containsString(values []string, expected string) bool {
 	return false
 }
 
-var _ adapter.RuntimeUserInbound = (*fakeRuntimeInbound)(nil)
-var _ adapter.InboundManager = (*fakeInboundManager)(nil)
-var _ trafficontrol.Tracker = (*fakeTracker)(nil)
+var (
+	_ adapter.RuntimeUserInbound = (*fakeRuntimeInbound)(nil)
+	_ adapter.InboundManager     = (*fakeInboundManager)(nil)
+	_ trafficontrol.Tracker      = (*fakeTracker)(nil)
+)
