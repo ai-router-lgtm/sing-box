@@ -237,9 +237,9 @@ func getPolicySnapshot(trafficManager *trafficontrol.Manager) func(w http.Respon
 			render.JSON(w, r, map[string]any{"error": "traffic manager unavailable"})
 			return
 		}
-		policies := trafficManager.PolicySnapshot()
+		policyRevision, policies := trafficManager.PolicyStateSnapshot()
 		render.JSON(w, r, map[string]any{
-			"revision": trafficManager.CurrentPolicyRevision(),
+			"revision": policyRevision,
 			"count":    len(policies),
 			"digest":   digestPolicies(policies),
 			"policies": policies,
@@ -257,8 +257,7 @@ func getRuntimeStatus(state *runtimeState) func(w http.ResponseWriter, r *http.R
 		policies := []trafficontrol.PrincipalPolicy{}
 		policyRevision := int64(0)
 		if state.traffic != nil {
-			policies = state.traffic.PolicySnapshot()
-			policyRevision = state.traffic.CurrentPolicyRevision()
+			policyRevision, policies = state.traffic.PolicyStateSnapshot()
 		}
 		render.JSON(w, r, map[string]any{
 			"ready":               state.inbound != nil && state.traffic != nil,

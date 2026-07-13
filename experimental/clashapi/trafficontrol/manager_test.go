@@ -220,6 +220,26 @@ func TestPolicySnapshotIsSortedAndDetached(t *testing.T) {
 	}
 }
 
+func TestPolicyStateSnapshotReturnsMatchingRevision(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager()
+	if !manager.ApplyPolicyRevision(7, true, []PrincipalPolicy{{Principal: "user-7", UpBPS: 700}}) {
+		t.Fatal("expected policy revision to apply")
+	}
+	revision, policies := manager.PolicyStateSnapshot()
+	if revision != 7 || len(policies) != 1 || policies[0].Principal != "user-7" || policies[0].UpBPS != 700 {
+		t.Fatalf("unexpected policy state snapshot: revision=%d policies=%+v", revision, policies)
+	}
+	if manager.ApplyPolicyRevision(6, true, []PrincipalPolicy{{Principal: "stale"}}) {
+		t.Fatal("expected stale policy revision to be rejected")
+	}
+	revision, policies = manager.PolicyStateSnapshot()
+	if revision != 7 || len(policies) != 1 || policies[0].Principal != "user-7" {
+		t.Fatalf("stale update changed policy state: revision=%d policies=%+v", revision, policies)
+	}
+}
+
 func TestPolicyForPrincipalPreferExactOverWildcard(t *testing.T) {
 	t.Parallel()
 

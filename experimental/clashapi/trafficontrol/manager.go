@@ -255,11 +255,11 @@ func (m *Manager) CurrentPolicyRevision() int64 {
 }
 
 func (m *Manager) ApplyPolicyRevision(revision int64, replace bool, policies []PrincipalPolicy) bool {
+	m.policiesAccess.Lock()
+	defer m.policiesAccess.Unlock()
 	if revision > 0 && revision < m.policyRevision.Load() {
 		return false
 	}
-
-	m.policiesAccess.Lock()
 	if replace {
 		m.policies = make(map[string]PrincipalPolicy, len(policies))
 	}
@@ -280,8 +280,6 @@ func (m *Manager) ApplyPolicyRevision(revision int64, replace bool, policies []P
 		}
 		m.policies[principal] = policy
 	}
-	m.policiesAccess.Unlock()
-
 	if revision > 0 {
 		m.policyRevision.Store(revision)
 	}
@@ -340,7 +338,15 @@ func (m *Manager) DisconnectSelectors(principals, userIDs []string) int {
 
 // PolicySnapshot returns a stable, detached copy of all configured policies.
 func (m *Manager) PolicySnapshot() []PrincipalPolicy {
+	_, policies := m.PolicyStateSnapshot()
+	return policies
+}
+
+// PolicyStateSnapshot returns a revision and policy copy from the same lock
+// boundary so Runtime status cannot mix states from concurrent updates.
+func (m *Manager) PolicyStateSnapshot() (int64, []PrincipalPolicy) {
 	m.policiesAccess.RLock()
+	revision := m.policyRevision.Load()
 	result := make([]PrincipalPolicy, 0, len(m.policies))
 	for _, policy := range m.policies {
 		result = append(result, policy)
@@ -349,7 +355,7 @@ func (m *Manager) PolicySnapshot() []PrincipalPolicy {
 	sort.Slice(result, func(i, j int) bool {
 		return result[i].Principal < result[j].Principal
 	})
-	return result
+	return revision, result
 }
 
 func (m *Manager) SnapshotByPrincipal() []PrincipalSnapshot {
