@@ -17,6 +17,14 @@ type fakeTracker struct {
 	closed   atomic.Bool
 }
 
+type blockingTracker struct {
+	metadata TrackerMetadata
+	closed   atomic.Bool
+	active   *atomic.Int64
+	maximum  *atomic.Int64
+	release  <-chan struct{}
+}
+
 func newFakeTracker(principal string) *fakeTracker {
 	id, _ := uuid.NewV4()
 	return &fakeTracker{
@@ -36,6 +44,37 @@ func (t *fakeTracker) Metadata() *TrackerMetadata {
 }
 
 func (t *fakeTracker) Close() error {
+	t.closed.Store(true)
+	return nil
+}
+
+func newBlockingTracker(principal string, active, maximum *atomic.Int64, release <-chan struct{}) *blockingTracker {
+	id, _ := uuid.NewV4()
+	return &blockingTracker{
+		metadata: TrackerMetadata{
+			ID: id,
+			Metadata: adapter.InboundContext{
+				User: principal,
+			},
+			Upload:   &atomic.Int64{},
+			Download: &atomic.Int64{},
+		},
+		active:  active,
+		maximum: maximum,
+		release: release,
+	}
+}
+
+func (t *blockingTracker) Metadata() *TrackerMetadata {
+	return &t.metadata
+}
+
+func (t *blockingTracker) Close() error {
+	active := t.active.Add(1)
+	for maximum := t.maximum.Load(); active > maximum && !t.maximum.CompareAndSwap(maximum, active); maximum = t.maximum.Load() {
+	}
+	<-t.release
+	t.active.Add(-1)
 	t.closed.Store(true)
 	return nil
 }
@@ -192,6 +231,61 @@ func TestDisconnectSelectorsHundredUsersSingleScan(t *testing.T) {
 	}
 	if scans.Load() != 1 {
 		t.Fatalf("expected one scan for 100 users, got %d", scans.Load())
+	}
+	for index, tracker := range trackers {
+		if !tracker.closed.Load() {
+			t.Fatalf("tracker %d was not closed", index)
+		}
+	}
+}
+
+func TestDisconnectSelectorsClosesWithBoundedConcurrency(t *testing.T) {
+	manager := NewManager()
+	var active atomic.Int64
+	var maximum atomic.Int64
+	release := make(chan struct{})
+	trackerCount := disconnectCloseWorkers + 5
+	trackers := make([]*blockingTracker, 0, trackerCount)
+	userIDs := make([]string, 0, trackerCount)
+	for index := 0; index < trackerCount; index++ {
+		userID := fmt.Sprintf("blocking-user-%03d", index)
+		tracker := newBlockingTracker(userID+":device-1", &active, &maximum, release)
+		trackers = append(trackers, tracker)
+		userIDs = append(userIDs, userID)
+		manager.Join(tracker)
+	}
+
+	result := make(chan int, 1)
+	go func() {
+		result <- manager.DisconnectSelectors(nil, userIDs)
+	}()
+
+	deadline := time.After(5 * time.Second)
+	for active.Load() != disconnectCloseWorkers {
+		select {
+		case <-deadline:
+			close(release)
+			t.Fatalf("expected %d concurrent closes, active=%d maximum=%d", disconnectCloseWorkers, active.Load(), maximum.Load())
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if maximum.Load() > disconnectCloseWorkers {
+		close(release)
+		t.Fatalf("close concurrency exceeded limit: %d", maximum.Load())
+	}
+	close(release)
+
+	select {
+	case disconnected := <-result:
+		if disconnected != trackerCount {
+			t.Fatalf("expected %d disconnected, got %d", trackerCount, disconnected)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("disconnect did not finish after releasing blocked closes")
+	}
+	if maximum.Load() != disconnectCloseWorkers {
+		t.Fatalf("expected maximum close concurrency %d, got %d", disconnectCloseWorkers, maximum.Load())
 	}
 	for index, tracker := range trackers {
 		if !tracker.closed.Load() {

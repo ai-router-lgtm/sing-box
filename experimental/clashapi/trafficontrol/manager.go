@@ -35,7 +35,10 @@ type ConnectionEvent struct {
 	ClosedAt      time.Time
 }
 
-const closedConnectionsLimit = 1000
+const (
+	closedConnectionsLimit = 1000
+	disconnectCloseWorkers = 512
+)
 
 const (
 	principalCounterTTL           = 30 * 24 * time.Hour
@@ -330,10 +333,32 @@ func (m *Manager) DisconnectSelectors(principals, userIDs []string) int {
 		}
 		return true
 	})
-	for _, tracker := range selected {
-		_ = tracker.Close()
-	}
+	closeTrackers(selected)
 	return len(selected)
+}
+
+func closeTrackers(trackers []Tracker) {
+	workerCount := min(len(trackers), disconnectCloseWorkers)
+	if workerCount == 0 {
+		return
+	}
+
+	jobs := make(chan Tracker)
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer workers.Done()
+			for tracker := range jobs {
+				_ = tracker.Close()
+			}
+		}()
+	}
+	for _, tracker := range trackers {
+		jobs <- tracker
+	}
+	close(jobs)
+	workers.Wait()
 }
 
 // PolicySnapshot returns a stable, detached copy of all configured policies.
