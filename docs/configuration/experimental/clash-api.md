@@ -171,6 +171,20 @@ When `experimental.clash_api.external_controller` is enabled, sing-box also expo
 
 These endpoints are designed for control-plane and node-agent integrations that need real-time user/policy updates without full process reload.
 
+#### GET `/runtime/status`
+
+Return the current Runtime process identity and convergence state:
+
+- `runtime_instance_id`: a new UUID for every sing-box process start.
+- `version` and `started_at`.
+- `capabilities`: supported Runtime control features.
+- user and policy `revision`, `count`, and SHA-256 `digest` values.
+- `user_state`: count and digest for each managed inbound.
+
+The response never contains user UUIDs or passwords. Digests cover credentials so a control plane can verify state without retrieving plaintext credentials.
+
+Digest input is compact JSON encoded as UTF-8 and hashed with SHA-256. Managed users are sorted by inbound and principal and use the fields `inbound`, `principal`, optional `uuid/password/flow/alter_id`, and `enabled`. Policies are sorted by principal. Compatibility fixtures are maintained in `experimental/clashapi/runtime_test.go` so control-plane implementations can verify their encoder.
+
 #### PUT `/runtime/policy`
 
 Apply principal-based policy revision.
@@ -200,6 +214,10 @@ Response fields:
 - `requestId`: echoed request id.
 - `rejected`: `stale_revision` when revision is older than current revision.
 
+#### GET `/runtime/policy/snapshot`
+
+Return the sorted effective policy snapshot together with its revision, count, and digest. This endpoint is intended for a loopback controller or authenticated node-agent proxy.
+
 #### POST `/runtime/disconnect`
 
 Disconnect by principal or by user id.
@@ -219,6 +237,18 @@ Request body examples:
 ```
 
 `user_id` without `device_id` disconnects both `user_id` and `user_id:*`.
+
+Batch requests accept up to 1000 unique selectors and scan the connection table once:
+
+```json
+{
+  "request_id": "drain-node-001",
+  "principals": ["user-1:device-1"],
+  "user_ids": ["user-2", "user-3"]
+}
+```
+
+Repeated non-empty `request_id` values return the cached result with `idempotent: true` and do not scan connections again.
 
 #### GET `/runtime/stats/snapshot`
 
@@ -259,6 +289,8 @@ Request body:
 Supported runtime user inbounds include VLESS, VMess, Trojan, TUIC and Hysteria2.
 
 `upsert` accepts `principal` and also accepts `name` as a compatibility alias of `principal`.
+
+For authoritative recovery, set `replace_managed: true`. Each operation then contains the complete desired managed-user set for that inbound. Runtime users previously written through this API but missing from the request are removed. Users from the static sing-box configuration are preserved, including when a managed user temporarily overrides the same principal.
 
 Response fields:
 

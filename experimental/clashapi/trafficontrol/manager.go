@@ -86,7 +86,8 @@ type Manager struct {
 	principalCounters       map[string]*principalCounter
 	lastPrincipalPruneUnix  atomic.Int64
 
-	eventSubscriber *observable.Subscriber[ConnectionEvent]
+	eventSubscriber    *observable.Subscriber[ConnectionEvent]
+	disconnectScanHook func()
 }
 
 func NewManager() *Manager {
@@ -254,11 +255,11 @@ func (m *Manager) CurrentPolicyRevision() int64 {
 }
 
 func (m *Manager) ApplyPolicyRevision(revision int64, replace bool, policies []PrincipalPolicy) bool {
+	m.policiesAccess.Lock()
+	defer m.policiesAccess.Unlock()
 	if revision > 0 && revision < m.policyRevision.Load() {
 		return false
 	}
-
-	m.policiesAccess.Lock()
 	if replace {
 		m.policies = make(map[string]PrincipalPolicy, len(policies))
 	}
@@ -279,8 +280,6 @@ func (m *Manager) ApplyPolicyRevision(revision int64, replace bool, policies []P
 		}
 		m.policies[principal] = policy
 	}
-	m.policiesAccess.Unlock()
-
 	if revision > 0 {
 		m.policyRevision.Store(revision)
 	}
@@ -288,14 +287,45 @@ func (m *Manager) ApplyPolicyRevision(revision int64, replace bool, policies []P
 }
 
 func (m *Manager) DisconnectPrincipal(principal string) int {
-	principal = strings.TrimSpace(principal)
-	if principal == "" {
+	return m.DisconnectSelectors([]string{principal}, nil)
+}
+
+func (m *Manager) DisconnectUser(userID string) int {
+	return m.DisconnectSelectors(nil, []string{userID})
+}
+
+// DisconnectSelectors closes every connection matched by an exact principal
+// or a user ID. All selectors are evaluated during one connection-map scan.
+func (m *Manager) DisconnectSelectors(principals, userIDs []string) int {
+	principalSet := make(map[string]struct{}, len(principals))
+	for _, principal := range principals {
+		principal = strings.TrimSpace(principal)
+		if principal != "" {
+			principalSet[principal] = struct{}{}
+		}
+	}
+	userSet := make(map[string]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		userID = strings.TrimSpace(userID)
+		if userID != "" {
+			userSet[userID] = struct{}{}
+		}
+	}
+	if len(principalSet) == 0 && len(userSet) == 0 {
 		return 0
+	}
+	if m.disconnectScanHook != nil {
+		m.disconnectScanHook()
 	}
 	var selected []Tracker
 	m.connections.Range(func(_ uuid.UUID, value Tracker) bool {
-		metadata := value.Metadata()
-		if metadataPrincipal(metadata) == principal {
+		principal := metadataPrincipal(value.Metadata())
+		if _, matched := principalSet[principal]; matched {
+			selected = append(selected, value)
+			return true
+		}
+		userID := principalUserID(principal)
+		if _, matched := userSet[userID]; matched {
 			selected = append(selected, value)
 		}
 		return true
@@ -306,24 +336,26 @@ func (m *Manager) DisconnectPrincipal(principal string) int {
 	return len(selected)
 }
 
-func (m *Manager) DisconnectUser(userID string) int {
-	userID = strings.TrimSpace(userID)
-	if userID == "" {
-		return 0
+// PolicySnapshot returns a stable, detached copy of all configured policies.
+func (m *Manager) PolicySnapshot() []PrincipalPolicy {
+	_, policies := m.PolicyStateSnapshot()
+	return policies
+}
+
+// PolicyStateSnapshot returns a revision and policy copy from the same lock
+// boundary so Runtime status cannot mix states from concurrent updates.
+func (m *Manager) PolicyStateSnapshot() (int64, []PrincipalPolicy) {
+	m.policiesAccess.RLock()
+	revision := m.policyRevision.Load()
+	result := make([]PrincipalPolicy, 0, len(m.policies))
+	for _, policy := range m.policies {
+		result = append(result, policy)
 	}
-	prefix := userID + ":"
-	var selected []Tracker
-	m.connections.Range(func(_ uuid.UUID, value Tracker) bool {
-		principal := metadataPrincipal(value.Metadata())
-		if principal == userID || strings.HasPrefix(principal, prefix) {
-			selected = append(selected, value)
-		}
-		return true
+	m.policiesAccess.RUnlock()
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Principal < result[j].Principal
 	})
-	for _, tracker := range selected {
-		_ = tracker.Close()
-	}
-	return len(selected)
+	return revision, result
 }
 
 func (m *Manager) SnapshotByPrincipal() []PrincipalSnapshot {

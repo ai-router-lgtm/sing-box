@@ -1,8 +1,8 @@
 # Runtime 改造当前状态存档
 
-更新时间：2026-04-02 06:45:51 CST
-仓库：`/Users/apple/Documents/study/sing-box`
-分支：`testing`
+更新时间：2026-07-11 CST
+仓库：`/Users/apple/Documents/GitHub/velo/sing-box`
+分支：`feat/runtime-control-v2`
 
 ## 1) 已完成内容
 
@@ -12,6 +12,11 @@
   - `DELETE /runtime/users/{principal}?inbound={tag}`
   - `POST /runtime/disconnect`
   - `GET /runtime/stats/snapshot`
+  - `GET /runtime/status`
+  - `GET /runtime/policy/snapshot`
+- `POST /runtime/disconnect` 已支持最多 1000 个 selector 的批量请求、单次连接扫描和 request ID 幂等。
+- `PUT /runtime/users` 已支持 `replace_managed=true`，权威替换 Runtime 受管用户且保留静态配置用户。
+- Runtime status 已提供进程实例 ID、能力列表及用户/策略 count/digest，不返回认证凭据明文。
 - 已支持 runtime users 兼容映射：`upsert.name -> principal`
 - 已支持 policy 通配优先级：`u:d` > `u:*` > 无策略
 - 已补齐测试：
@@ -26,9 +31,10 @@
 已通过：
 
 - `go test ./experimental/clashapi/...`
+- `go test ./...`
 - `go test ./protocol/vless ./protocol/vmess ./protocol/trojan ./protocol/tuic ./protocol/hysteria2 ./protocol/hysteria ./protocol/shadowsocks`
 
-## 3) 提交与标签
+## 3) Baseline 提交与标签
 
 最近三次核心提交：
 
@@ -47,4 +53,4 @@
 - wildcard 联调用例的实机输出留档：
   - `guide/runtime/verify-runtime-user-control-template.sh`
 
-说明：当前代码与单元/包级回归已完成，剩余为你本地联调环境链路可达性与验收输出留档。
+说明：Runtime v2 代码与全仓单元测试已完成，剩余为控制面能力探测、镜像构建和临时节点实机验收。

@@ -22,6 +22,9 @@ linters:
     - paralleltest
     - staticcheck
   settings:
+    govet:
+      disable:
+        - inline
     staticcheck:
       checks:
         - all

@@ -30,6 +30,7 @@ type RuntimeUser struct {
 
 type RuntimeUserInbound interface {
 	Inbound
+	SnapshotRuntimeUsers() []RuntimeUser
 	UpsertRuntimeUsers(users []RuntimeUser) (int, error)
 	DeleteRuntimeUsers(principals []string) (int, error)
 }

@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,6 +22,7 @@ import (
 
 type fakeRuntimeInbound struct {
 	tag           string
+	snapshot      []adapter.RuntimeUser
 	lastUpsert    []adapter.RuntimeUser
 	lastDelete    []string
 	upsertCount   int
@@ -31,6 +35,10 @@ func (f *fakeRuntimeInbound) Start(stage adapter.StartStage) error { return nil 
 func (f *fakeRuntimeInbound) Close() error                         { return nil }
 func (f *fakeRuntimeInbound) Type() string                         { return "vless" }
 func (f *fakeRuntimeInbound) Tag() string                          { return f.tag }
+
+func (f *fakeRuntimeInbound) SnapshotRuntimeUsers() []adapter.RuntimeUser {
+	return append([]adapter.RuntimeUser(nil), f.snapshot...)
+}
 
 func (f *fakeRuntimeInbound) UpsertRuntimeUsers(users []adapter.RuntimeUser) (int, error) {
 	f.upsertInvoked++
@@ -88,6 +96,7 @@ func (m *fakeInboundManager) Create(ctx context.Context, router adapter.Router, 
 type fakeTracker struct {
 	metadata trafficontrol.TrackerMetadata
 	closed   atomic.Bool
+	closes   atomic.Int64
 }
 
 func newFakeTracker(principal string) *fakeTracker {
@@ -107,6 +116,7 @@ func newFakeTracker(principal string) *fakeTracker {
 func (t *fakeTracker) Metadata() *trafficontrol.TrackerMetadata { return &t.metadata }
 func (t *fakeTracker) Close() error {
 	t.closed.Store(true)
+	t.closes.Add(1)
 	return nil
 }
 
@@ -117,6 +127,8 @@ func newRuntimeTestServer(inboundManager adapter.InboundManager) (*trafficontrol
 }
 
 func TestRuntimeUsersBadRequest(t *testing.T) {
+	t.Parallel()
+
 	_, server := newRuntimeTestServer(newFakeInboundManager())
 	defer server.Close()
 
@@ -133,6 +145,8 @@ func TestRuntimeUsersBadRequest(t *testing.T) {
 }
 
 func TestRuntimeUsersInboundNotFound(t *testing.T) {
+	t.Parallel()
+
 	_, server := newRuntimeTestServer(newFakeInboundManager())
 	defer server.Close()
 
@@ -150,6 +164,8 @@ func TestRuntimeUsersInboundNotFound(t *testing.T) {
 }
 
 func TestRuntimeUsersRevisionAndIdempotent(t *testing.T) {
+	t.Parallel()
+
 	inbound := &fakeRuntimeInbound{tag: "vless-in"}
 	_, server := newRuntimeTestServer(newFakeInboundManager(inbound))
 	defer server.Close()
@@ -208,6 +224,8 @@ func TestRuntimeUsersRevisionAndIdempotent(t *testing.T) {
 }
 
 func TestRuntimeUsersUpsertNameAlias(t *testing.T) {
+	t.Parallel()
+
 	inbound := &fakeRuntimeInbound{tag: "vless-in"}
 	_, server := newRuntimeTestServer(newFakeInboundManager(inbound))
 	defer server.Close()
@@ -231,7 +249,169 @@ func TestRuntimeUsersUpsertNameAlias(t *testing.T) {
 	}
 }
 
+func TestRuntimeUsersReplaceManagedPreservesStaticUsersAndStableDigest(t *testing.T) {
+	t.Parallel()
+
+	staticUUID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	inbound := &fakeRuntimeInbound{
+		tag: "vless-in",
+		snapshot: []adapter.RuntimeUser{{
+			Principal: "static-admin",
+			UUID:      staticUUID,
+		}},
+	}
+	_, server := newRuntimeTestServer(newFakeInboundManager(inbound))
+	defer server.Close()
+
+	applyRuntimePayload(t, server.URL, `{
+		"revision":1,
+		"request_id":"seed-managed",
+		"operations":[{"inbound":"vless-in","upsert":[
+			{"principal":"static-admin","uuid":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"},
+			{"principal":"u1:d1","uuid":"11111111-1111-1111-1111-111111111111"}
+		]}]
+	}`)
+	applyRuntimePayload(t, server.URL, `{
+		"revision":2,
+		"request_id":"replace-managed-1",
+		"replace_managed":true,
+		"operations":[{"inbound":"vless-in","upsert":[
+			{"principal":"u3:d1","uuid":"33333333-3333-3333-3333-333333333333"},
+			{"principal":"u2:d1","uuid":"22222222-2222-2222-2222-222222222222"}
+		]}]
+	}`)
+
+	if len(inbound.lastDelete) != 1 || inbound.lastDelete[0] != "u1:d1" {
+		t.Fatalf("replace_managed must delete only stale managed users, got=%v", inbound.lastDelete)
+	}
+	upsertByPrincipal := make(map[string]adapter.RuntimeUser)
+	for _, runtimeUser := range inbound.lastUpsert {
+		upsertByPrincipal[runtimeUser.Principal] = runtimeUser
+	}
+	if restored, found := upsertByPrincipal["static-admin"]; !found || restored.UUID != staticUUID {
+		t.Fatalf("expected original static user restored, got=%+v found=%v", restored, found)
+	}
+	if _, found := upsertByPrincipal["u2:d1"]; !found {
+		t.Fatal("expected desired managed user u2:d1")
+	}
+	if _, found := upsertByPrincipal["u3:d1"]; !found {
+		t.Fatal("expected desired managed user u3:d1")
+	}
+
+	firstStatusBody := getRuntimeStatusBody(t, server.URL)
+	var firstStatus struct {
+		RuntimeInstanceID string `json:"runtime_instance_id"`
+		UserCount         int    `json:"user_count"`
+		UserDigest        string `json:"user_digest"`
+		UserState         []struct {
+			Inbound string `json:"inbound"`
+			Count   int    `json:"count"`
+			Digest  string `json:"digest"`
+		} `json:"user_state"`
+	}
+	if err := json.Unmarshal(firstStatusBody, &firstStatus); err != nil {
+		t.Fatalf("decode runtime status: %v", err)
+	}
+	if firstStatus.RuntimeInstanceID == "" || firstStatus.UserCount != 2 || len(firstStatus.UserDigest) != 64 {
+		t.Fatalf("unexpected runtime status: %+v", firstStatus)
+	}
+	if len(firstStatus.UserState) != 1 || firstStatus.UserState[0].Inbound != "vless-in" || firstStatus.UserState[0].Count != 2 {
+		t.Fatalf("unexpected inbound user state: %+v", firstStatus.UserState)
+	}
+	for _, secret := range []string{staticUUID, "22222222-2222-2222-2222-222222222222", "33333333-3333-3333-3333-333333333333"} {
+		if bytes.Contains(firstStatusBody, []byte(secret)) {
+			t.Fatalf("runtime status leaked credential %s", secret)
+		}
+	}
+
+	applyRuntimePayload(t, server.URL, `{
+		"revision":3,
+		"request_id":"replace-managed-2",
+		"replace_managed":true,
+		"operations":[{"inbound":"vless-in","upsert":[
+			{"principal":"u2:d1","uuid":"22222222-2222-2222-2222-222222222222"},
+			{"principal":"u3:d1","uuid":"33333333-3333-3333-3333-333333333333"}
+		]}]
+	}`)
+	secondStatusBody := getRuntimeStatusBody(t, server.URL)
+	var secondStatus struct {
+		RuntimeInstanceID string `json:"runtime_instance_id"`
+		UserDigest        string `json:"user_digest"`
+	}
+	if err := json.Unmarshal(secondStatusBody, &secondStatus); err != nil {
+		t.Fatalf("decode second runtime status: %v", err)
+	}
+	if secondStatus.RuntimeInstanceID != firstStatus.RuntimeInstanceID || secondStatus.UserDigest != firstStatus.UserDigest {
+		t.Fatalf("expected stable instance and order-independent digest: first=%+v second=%+v", firstStatus, secondStatus)
+	}
+}
+
+func TestRuntimeDisconnectBatchIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	trafficManager, server := newRuntimeTestServer(newFakeInboundManager())
+	defer server.Close()
+
+	user := newFakeTracker("u1:d1")
+	bareUser := newFakeTracker("u1")
+	exact := newFakeTracker("u2:d1")
+	other := newFakeTracker("u3:d1")
+	for _, tracker := range []*fakeTracker{user, bareUser, exact, other} {
+		trafficManager.Join(tracker)
+	}
+	payload := `{"request_id":"disconnect-batch-1","user_ids":["u1","u1"],"principals":["u2:d1","u2:d1"]}`
+	responseBody := runtimeJSONRequest(t, http.MethodPost, server.URL+"/disconnect", payload, http.StatusOK)
+	var response disconnectPrincipalResponse
+	if err := json.Unmarshal(responseBody, &response); err != nil {
+		t.Fatalf("decode disconnect response: %v", err)
+	}
+	if response.SelectorCount != 2 || response.Disconnected != 3 || response.Idempotent {
+		t.Fatalf("unexpected disconnect response: %+v", response)
+	}
+	if other.closed.Load() {
+		t.Fatal("unexpected close for unmatched tracker")
+	}
+
+	late := newFakeTracker("u1:d2")
+	trafficManager.Join(late)
+	secondBody := runtimeJSONRequest(t, http.MethodPost, server.URL+"/disconnect", payload, http.StatusOK)
+	var second disconnectPrincipalResponse
+	if err := json.Unmarshal(secondBody, &second); err != nil {
+		t.Fatalf("decode idempotent response: %v", err)
+	}
+	if !second.Idempotent || second.Disconnected != 3 {
+		t.Fatalf("expected cached disconnect response, got %+v", second)
+	}
+	if late.closed.Load() {
+		t.Fatal("idempotent retry must not rescan and close a later connection")
+	}
+	if user.closes.Load() != 1 || bareUser.closes.Load() != 1 || exact.closes.Load() != 1 {
+		t.Fatalf("expected each original tracker closed once: user=%d bare=%d exact=%d", user.closes.Load(), bareUser.closes.Load(), exact.closes.Load())
+	}
+}
+
+func TestRuntimeDisconnectRejectsMoreThanMaximumSelectors(t *testing.T) {
+	t.Parallel()
+
+	_, server := newRuntimeTestServer(newFakeInboundManager())
+	defer server.Close()
+	principals := make([]string, maxRuntimeDisconnectSelectors+1)
+	for index := range principals {
+		principals[index] = fmt.Sprintf("u%d:d1", index)
+	}
+	payload, err := json.Marshal(map[string]any{"principals": principals})
+	if err != nil {
+		t.Fatalf("marshal selectors: %v", err)
+	}
+	responseBody := runtimeJSONRequest(t, http.MethodPost, server.URL+"/disconnect", string(payload), http.StatusBadRequest)
+	if !strings.Contains(string(responseBody), "too many selectors") {
+		t.Fatalf("unexpected selector limit response: %s", responseBody)
+	}
+}
+
 func TestRuntimeDisconnectByUserIDIncludesWildcard(t *testing.T) {
+	t.Parallel()
+
 	trafficManager, server := newRuntimeTestServer(newFakeInboundManager())
 	defer server.Close()
 
@@ -263,6 +443,8 @@ func TestRuntimeDisconnectByUserIDIncludesWildcard(t *testing.T) {
 }
 
 func TestRuntimePolicyRequestIDAndStale(t *testing.T) {
+	t.Parallel()
+
 	_, server := newRuntimeTestServer(newFakeInboundManager())
 	defer server.Close()
 
@@ -308,7 +490,83 @@ func TestRuntimePolicyRequestIDAndStale(t *testing.T) {
 	}
 }
 
+func TestRuntimePolicySnapshotMatchesStatusDigest(t *testing.T) {
+	t.Parallel()
+
+	_, server := newRuntimeTestServer(newFakeInboundManager())
+	defer server.Close()
+	policyPayload := `{"revision":12,"request_id":"policy-snapshot","replace":true,"policies":[{"principal":"u2:*","up_bps":200},{"principal":"u1:d1","down_bps":100}]}`
+	_ = runtimeJSONRequest(t, http.MethodPut, server.URL+"/policy", policyPayload, http.StatusOK)
+
+	snapshotBody := runtimeJSONRequest(t, http.MethodGet, server.URL+"/policy/snapshot", "", http.StatusOK)
+	var snapshot struct {
+		Revision int64                           `json:"revision"`
+		Count    int                             `json:"count"`
+		Digest   string                          `json:"digest"`
+		Policies []trafficontrol.PrincipalPolicy `json:"policies"`
+	}
+	if err := json.Unmarshal(snapshotBody, &snapshot); err != nil {
+		t.Fatalf("decode policy snapshot: %v", err)
+	}
+	if snapshot.Revision != 12 || snapshot.Count != 2 || len(snapshot.Digest) != 64 {
+		t.Fatalf("unexpected policy snapshot: %+v", snapshot)
+	}
+	if len(snapshot.Policies) != 2 || snapshot.Policies[0].Principal != "u1:d1" || snapshot.Policies[1].Principal != "u2:*" {
+		t.Fatalf("expected sorted policies, got %+v", snapshot.Policies)
+	}
+
+	statusBody := getRuntimeStatusBody(t, server.URL)
+	var status struct {
+		Ready          bool     `json:"ready"`
+		Capabilities   []string `json:"capabilities"`
+		PolicyRevision int64    `json:"policy_revision"`
+		PolicyCount    int      `json:"policy_count"`
+		PolicyDigest   string   `json:"policy_digest"`
+	}
+	if err := json.Unmarshal(statusBody, &status); err != nil {
+		t.Fatalf("decode runtime status: %v", err)
+	}
+	if !status.Ready || status.PolicyRevision != snapshot.Revision || status.PolicyCount != snapshot.Count || status.PolicyDigest != snapshot.Digest {
+		t.Fatalf("status and snapshot mismatch: status=%+v snapshot=%+v", status, snapshot)
+	}
+	if !containsString(status.Capabilities, "runtime_disconnect_batch") || !containsString(status.Capabilities, "runtime_users_replace_managed") {
+		t.Fatalf("missing runtime v2 capabilities: %v", status.Capabilities)
+	}
+}
+
+func TestRuntimeDigestFixtures(t *testing.T) {
+	t.Parallel()
+
+	emptyPolicyDigest := digestPolicies(nil)
+	if emptyPolicyDigest != "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945" {
+		t.Fatalf("empty policy digest must use canonical JSON array: %s", emptyPolicyDigest)
+	}
+
+	users := map[string]adapter.RuntimeUser{
+		"u1:d1": {
+			Principal: "u1:d1",
+			UUID:      "11111111-1111-1111-1111-111111111111",
+			Flow:      "xtls-rprx-vision",
+		},
+	}
+	userDigest := digestJSON(canonicalRuntimeUsers("vless-in", users))
+	if userDigest != "76767ee449b634a15a6412e7105c5790032af804bc3e39456b2b2eb2c6a88d9d" {
+		t.Fatalf("unexpected user digest fixture: %s", userDigest)
+	}
+	policyDigest := digestPolicies([]trafficontrol.PrincipalPolicy{{
+		Principal:      "u1:*",
+		MaxConnections: 2,
+		UpBPS:          125000,
+		DownBPS:        250000,
+	}})
+	if policyDigest != "a26b9c164e60009f4da9782550771f098f76e2fa391520c18cb4aa1556bbc2ed" {
+		t.Fatalf("unexpected policy digest fixture: %s", policyDigest)
+	}
+}
+
 func TestRuntimeStatsSnapshotUsesPrincipalCumulativeTotals(t *testing.T) {
+	t.Parallel()
+
 	trafficManager, server := newRuntimeTestServer(newFakeInboundManager())
 	defer server.Close()
 
@@ -362,6 +620,55 @@ func TestRuntimeStatsSnapshotUsesPrincipalCumulativeTotals(t *testing.T) {
 	t.Fatal("expected u1:d1 principal stats in snapshot")
 }
 
-var _ adapter.RuntimeUserInbound = (*fakeRuntimeInbound)(nil)
-var _ adapter.InboundManager = (*fakeInboundManager)(nil)
-var _ trafficontrol.Tracker = (*fakeTracker)(nil)
+func applyRuntimePayload(t *testing.T, serverURL, payload string) {
+	t.Helper()
+	_ = runtimeJSONRequest(t, http.MethodPut, serverURL+"/users", payload, http.StatusOK)
+}
+
+func getRuntimeStatusBody(t *testing.T, serverURL string) []byte {
+	t.Helper()
+	return runtimeJSONRequest(t, http.MethodGet, serverURL+"/status", "", http.StatusOK)
+}
+
+func runtimeJSONRequest(t *testing.T, method, targetURL, payload string, expectedStatus int) []byte {
+	t.Helper()
+	var body io.Reader
+	if payload != "" {
+		body = bytes.NewBufferString(payload)
+	}
+	req, err := http.NewRequest(method, targetURL, body)
+	if err != nil {
+		t.Fatalf("create %s request: %v", method, err)
+	}
+	if payload != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request %s %s failed: %v", method, targetURL, err)
+	}
+	defer resp.Body.Close()
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read %s response: %v", method, err)
+	}
+	if resp.StatusCode != expectedStatus {
+		t.Fatalf("expected status %d, got %d body=%s", expectedStatus, resp.StatusCode, responseBody)
+	}
+	return responseBody
+}
+
+func containsString(values []string, expected string) bool {
+	for _, value := range values {
+		if value == expected {
+			return true
+		}
+	}
+	return false
+}
+
+var (
+	_ adapter.RuntimeUserInbound = (*fakeRuntimeInbound)(nil)
+	_ adapter.InboundManager     = (*fakeInboundManager)(nil)
+	_ trafficontrol.Tracker      = (*fakeTracker)(nil)
+)

@@ -169,6 +169,20 @@ Clash 中的默认模式，默认使用 `Rule`。
 
 这些接口用于控制面或 node-agent 场景，以便在不 reload 进程的情况下实时更新用户与策略。
 
+#### GET `/runtime/status`
+
+返回当前 Runtime 进程身份和收敛状态：
+
+- `runtime_instance_id`：每次 sing-box 进程启动都会生成新的 UUID。
+- `version` 与 `started_at`。
+- `capabilities`：当前支持的 Runtime 控制能力。
+- 用户和策略的 `revision`、`count` 与 SHA-256 `digest`。
+- `user_state`：每个受管入站的用户数量和摘要。
+
+响应不会返回用户 UUID 或密码明文。摘要会覆盖认证字段，使控制面无需读取明文凭据即可核验状态。
+
+摘要输入使用 UTF-8 紧凑 JSON 并计算 SHA-256。受管用户按 inbound、principal 排序，字段为 `inbound`、`principal`、可选的 `uuid/password/flow/alter_id` 和 `enabled`；策略按 principal 排序。`experimental/clashapi/runtime_test.go` 保存了兼容 fixture，控制面可用它校验编码实现。
+
 #### PUT `/runtime/policy`
 
 应用基于 principal 的策略版本。
@@ -198,6 +212,10 @@ Clash 中的默认模式，默认使用 `Rule`。
 - `requestId`：回显请求 ID。
 - `rejected`：当版本过旧时为 `stale_revision`。
 
+#### GET `/runtime/policy/snapshot`
+
+返回排序后的当前策略快照及 revision、数量和摘要。该接口应只由本机控制器或经过认证的 node-agent 代理访问。
+
 #### POST `/runtime/disconnect`
 
 按 principal 或用户维度断开连接。
@@ -217,6 +235,18 @@ Clash 中的默认模式，默认使用 `Rule`。
 ```
 
 仅传 `user_id`（不带 `device_id`）时，会同时断开 `user_id` 与 `user_id:*`。
+
+批量请求最多接受 1000 个去重后的 selector，并且只扫描一次连接表：
+
+```json
+{
+  "request_id": "drain-node-001",
+  "principals": ["user-1:device-1"],
+  "user_ids": ["user-2", "user-3"]
+}
+```
+
+重复使用非空 `request_id` 时会返回缓存结果和 `idempotent: true`，不会再次扫描连接。
 
 #### GET `/runtime/stats/snapshot`
 
@@ -263,6 +293,8 @@ Clash 中的默认模式，默认使用 `Rule`。
 当前支持运行时用户更新的入站包括 VLESS、VMess、Trojan、TUIC、Hysteria2。
 
 `upsert` 除 `principal` 外，也支持 `name` 作为 `principal` 的兼容别名。
+
+控制面进行权威恢复时可设置 `replace_managed: true`。此时每个 operation 必须提供该入站完整的受管用户集合；此前通过 Runtime API 写入但本次缺失的用户会被删除，静态 sing-box 配置用户会被保留。即使受管用户临时覆盖了同名静态 principal，移除覆盖时也会恢复原静态用户。
 
 响应字段：
 

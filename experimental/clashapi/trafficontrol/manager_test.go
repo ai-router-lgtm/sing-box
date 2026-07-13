@@ -1,13 +1,15 @@
 package trafficontrol
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/gofrs/uuid/v5"
 	"github.com/sagernet/sing-box/adapter"
+
+	"github.com/gofrs/uuid/v5"
 )
 
 type fakeTracker struct {
@@ -48,6 +50,8 @@ func findPrincipalSnapshot(snapshots []PrincipalSnapshot, principal string) *Pri
 }
 
 func TestApplyPolicyRevisionRejectStale(t *testing.T) {
+	t.Parallel()
+
 	manager := NewManager()
 	ok := manager.ApplyPolicyRevision(10, true, []PrincipalPolicy{
 		{
@@ -79,6 +83,8 @@ func TestApplyPolicyRevisionRejectStale(t *testing.T) {
 }
 
 func TestJoinRejectWhenMaxConnectionsReached(t *testing.T) {
+	t.Parallel()
+
 	manager := NewManager()
 	manager.ApplyPolicyRevision(1, true, []PrincipalPolicy{
 		{
@@ -105,6 +111,8 @@ func TestJoinRejectWhenMaxConnectionsReached(t *testing.T) {
 }
 
 func TestDisconnectUserMatchesPrefix(t *testing.T) {
+	t.Parallel()
+
 	manager := NewManager()
 	u := newFakeTracker("user-1")
 	d1 := newFakeTracker("user-1:device-a")
@@ -128,7 +136,113 @@ func TestDisconnectUserMatchesPrefix(t *testing.T) {
 	}
 }
 
+func TestDisconnectSelectorsScansConnectionsOnce(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager()
+	var scans atomic.Int64
+	manager.disconnectScanHook = func() { scans.Add(1) }
+
+	trackers := []*fakeTracker{
+		newFakeTracker("user-1"),
+		newFakeTracker("user-1:device-a"),
+		newFakeTracker("user-2:device-a"),
+		newFakeTracker("user-3:device-a"),
+	}
+	for _, tracker := range trackers {
+		manager.Join(tracker)
+	}
+
+	disconnected := manager.DisconnectSelectors(
+		[]string{"user-2:device-a", "user-2:device-a"},
+		[]string{"user-1", "user-1"},
+	)
+	if disconnected != 3 {
+		t.Fatalf("expected 3 disconnected, got %d", disconnected)
+	}
+	if scans.Load() != 1 {
+		t.Fatalf("expected one connection scan, got %d", scans.Load())
+	}
+	if !trackers[0].closed.Load() || !trackers[1].closed.Load() || !trackers[2].closed.Load() {
+		t.Fatal("expected matching trackers closed")
+	}
+	if trackers[3].closed.Load() {
+		t.Fatal("unexpected close for unmatched tracker")
+	}
+}
+
+func TestDisconnectSelectorsHundredUsersSingleScan(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager()
+	var scans atomic.Int64
+	manager.disconnectScanHook = func() { scans.Add(1) }
+	userIDs := make([]string, 0, 100)
+	trackers := make([]*fakeTracker, 0, 100)
+	for index := 0; index < 100; index++ {
+		userID := fmt.Sprintf("user-%03d", index)
+		userIDs = append(userIDs, userID)
+		tracker := newFakeTracker(userID + ":device-1")
+		trackers = append(trackers, tracker)
+		manager.Join(tracker)
+	}
+
+	if disconnected := manager.DisconnectSelectors(nil, userIDs); disconnected != 100 {
+		t.Fatalf("expected 100 disconnected, got %d", disconnected)
+	}
+	if scans.Load() != 1 {
+		t.Fatalf("expected one scan for 100 users, got %d", scans.Load())
+	}
+	for index, tracker := range trackers {
+		if !tracker.closed.Load() {
+			t.Fatalf("tracker %d was not closed", index)
+		}
+	}
+}
+
+func TestPolicySnapshotIsSortedAndDetached(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager()
+	manager.ApplyPolicyRevision(2, true, []PrincipalPolicy{
+		{Principal: "u2:*", UpBPS: 200},
+		{Principal: "u1:d1", DownBPS: 100},
+	})
+
+	snapshot := manager.PolicySnapshot()
+	if len(snapshot) != 2 || snapshot[0].Principal != "u1:d1" || snapshot[1].Principal != "u2:*" {
+		t.Fatalf("unexpected policy snapshot: %+v", snapshot)
+	}
+	snapshot[0].DownBPS = 999
+	policy, found := manager.PolicyForPrincipal("u1:d1")
+	if !found || policy.DownBPS != 100 {
+		t.Fatalf("snapshot must not mutate manager state: %+v", policy)
+	}
+}
+
+func TestPolicyStateSnapshotReturnsMatchingRevision(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager()
+	if !manager.ApplyPolicyRevision(7, true, []PrincipalPolicy{{Principal: "user-7", UpBPS: 700}}) {
+		t.Fatal("expected policy revision to apply")
+	}
+	revision, policies := manager.PolicyStateSnapshot()
+	if revision != 7 || len(policies) != 1 || policies[0].Principal != "user-7" || policies[0].UpBPS != 700 {
+		t.Fatalf("unexpected policy state snapshot: revision=%d policies=%+v", revision, policies)
+	}
+	if manager.ApplyPolicyRevision(6, true, []PrincipalPolicy{{Principal: "stale"}}) {
+		t.Fatal("expected stale policy revision to be rejected")
+	}
+	revision, policies = manager.PolicyStateSnapshot()
+	if revision != 7 || len(policies) != 1 || policies[0].Principal != "user-7" {
+		t.Fatalf("stale update changed policy state: revision=%d policies=%+v", revision, policies)
+	}
+}
+
 func TestPolicyForPrincipalPreferExactOverWildcard(t *testing.T) {
+	t.Parallel()
+
 	manager := NewManager()
 	ok := manager.ApplyPolicyRevision(1, true, []PrincipalPolicy{
 		{
@@ -164,6 +278,8 @@ func TestPolicyForPrincipalPreferExactOverWildcard(t *testing.T) {
 }
 
 func TestSnapshotByPrincipalApplyWildcardPolicy(t *testing.T) {
+	t.Parallel()
+
 	manager := NewManager()
 	ok := manager.ApplyPolicyRevision(1, true, []PrincipalPolicy{
 		{
@@ -201,6 +317,8 @@ func TestSnapshotByPrincipalApplyWildcardPolicy(t *testing.T) {
 }
 
 func TestPolicyForPrincipalResolvedReturnsWildcardKey(t *testing.T) {
+	t.Parallel()
+
 	manager := NewManager()
 	ok := manager.ApplyPolicyRevision(1, true, []PrincipalPolicy{
 		{
@@ -225,6 +343,8 @@ func TestPolicyForPrincipalResolvedReturnsWildcardKey(t *testing.T) {
 }
 
 func TestDynamicRateLimitAggregatesByWildcardPolicyKey(t *testing.T) {
+	t.Parallel()
+
 	manager := NewManager()
 	ok := manager.ApplyPolicyRevision(1, true, []PrincipalPolicy{
 		{
@@ -260,6 +380,8 @@ func TestDynamicRateLimitAggregatesByWildcardPolicyKey(t *testing.T) {
 }
 
 func TestSnapshotByPrincipalMonotonicCounters(t *testing.T) {
+	t.Parallel()
+
 	manager := NewManager()
 	manager.PushPrincipalUploaded("u1:d1", 10)
 	manager.PushPrincipalDownloaded("u1:d1", 5)
@@ -287,6 +409,8 @@ func TestSnapshotByPrincipalMonotonicCounters(t *testing.T) {
 }
 
 func TestSnapshotByPrincipalReconnectKeepsTotals(t *testing.T) {
+	t.Parallel()
+
 	manager := NewManager()
 	tracker := newFakeTracker("u1:d1")
 	manager.Join(tracker)
@@ -327,6 +451,8 @@ func TestSnapshotByPrincipalReconnectKeepsTotals(t *testing.T) {
 }
 
 func TestPrincipalCounterConcurrentAccumulation(t *testing.T) {
+	t.Parallel()
+
 	manager := NewManager()
 	principals := []string{"u1:d1", "u1:d2", "u2:d1"}
 	const iterations = 200
@@ -366,6 +492,8 @@ func TestPrincipalCounterConcurrentAccumulation(t *testing.T) {
 }
 
 func TestPrincipalCounterTTLPrune(t *testing.T) {
+	t.Parallel()
+
 	manager := NewManager()
 	manager.PushPrincipalUploaded("stale:d1", 10)
 	manager.PushPrincipalUploaded("fresh:d1", 20)
