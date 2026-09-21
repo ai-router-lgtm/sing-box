@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/experimental/clashapi/trafficontrol"
@@ -21,14 +23,17 @@ import (
 )
 
 type fakeRuntimeInbound struct {
+	access        sync.RWMutex
 	tag           string
 	snapshot      []adapter.RuntimeUser
-	lastUpsert    []adapter.RuntimeUser
-	lastDelete    []string
-	upsertCount   int
-	deleteCount   int
-	upsertInvoked int
-	deleteInvoked int
+	lastReplace   []adapter.RuntimeUser
+	prepareError  error
+	prepareCount  int
+	commitCount   int
+	abortCount    int
+	releaseCount  int
+	applyStarted  chan struct{}
+	applyContinue <-chan struct{}
 }
 
 func (f *fakeRuntimeInbound) Start(stage adapter.StartStage) error { return nil }
@@ -37,20 +42,103 @@ func (f *fakeRuntimeInbound) Type() string                         { return "vle
 func (f *fakeRuntimeInbound) Tag() string                          { return f.tag }
 
 func (f *fakeRuntimeInbound) SnapshotRuntimeUsers() []adapter.RuntimeUser {
+	f.access.RLock()
+	defer f.access.RUnlock()
 	return append([]adapter.RuntimeUser(nil), f.snapshot...)
 }
 
 func (f *fakeRuntimeInbound) UpsertRuntimeUsers(users []adapter.RuntimeUser) (int, error) {
-	f.upsertInvoked++
-	f.lastUpsert = append([]adapter.RuntimeUser(nil), users...)
-	f.upsertCount += len(users)
+	f.access.Lock()
+	defer f.access.Unlock()
+	current := runtimeUserMap(f.snapshot)
+	for principal, runtimeUser := range runtimeUserMap(users) {
+		current[principal] = runtimeUser
+	}
+	f.snapshot = runtimeUserMapValues(current)
 	return len(users), nil
 }
 
 func (f *fakeRuntimeInbound) DeleteRuntimeUsers(principals []string) (int, error) {
-	f.deleteInvoked++
-	f.lastDelete = append([]string(nil), principals...)
-	f.deleteCount += len(principals)
+	f.access.Lock()
+	defer f.access.Unlock()
+	current := runtimeUserMap(f.snapshot)
+	deleted := 0
+	for _, principal := range principals {
+		if _, loaded := current[principal]; loaded {
+			delete(current, principal)
+			deleted++
+		}
+	}
+	f.snapshot = runtimeUserMapValues(current)
+	return deleted, nil
+}
+
+func (f *fakeRuntimeInbound) PrepareRuntimeUserReplace(users []adapter.RuntimeUser) (adapter.RuntimeUserReplaceTransaction, error) {
+	f.access.Lock()
+	f.prepareCount++
+	if f.prepareError != nil {
+		f.access.Unlock()
+		return nil, f.prepareError
+	}
+	current := runtimeUserMap(f.snapshot)
+	desired := runtimeUserMap(users)
+	deleted := 0
+	for principal := range current {
+		if _, loaded := desired[principal]; !loaded {
+			deleted++
+		}
+	}
+	return &fakeRuntimeUserReplaceTransaction{
+		inbound: f,
+		users:   runtimeUserMapValues(desired),
+		result:  adapter.RuntimeUserReplaceResult{Upserted: len(desired), Deleted: deleted},
+	}, nil
+}
+
+type fakeRuntimeUserReplaceTransaction struct {
+	inbound *fakeRuntimeInbound
+	users   []adapter.RuntimeUser
+	result  adapter.RuntimeUserReplaceResult
+}
+
+func (t *fakeRuntimeUserReplaceTransaction) Apply() adapter.RuntimeUserReplaceResult {
+	if t.inbound.applyStarted != nil {
+		close(t.inbound.applyStarted)
+	}
+	if t.inbound.applyContinue != nil {
+		<-t.inbound.applyContinue
+	}
+	t.inbound.commitCount++
+	t.inbound.snapshot = append([]adapter.RuntimeUser(nil), t.users...)
+	t.inbound.lastReplace = append([]adapter.RuntimeUser(nil), t.users...)
+	return t.result
+}
+
+func (t *fakeRuntimeUserReplaceTransaction) Release() {
+	t.inbound.releaseCount++
+	t.inbound.access.Unlock()
+}
+
+func (t *fakeRuntimeUserReplaceTransaction) Abort() {
+	t.inbound.abortCount++
+	t.inbound.access.Unlock()
+}
+
+type nonAtomicRuntimeInbound struct {
+	tag string
+}
+
+func (f *nonAtomicRuntimeInbound) Start(stage adapter.StartStage) error { return nil }
+func (f *nonAtomicRuntimeInbound) Close() error                         { return nil }
+func (f *nonAtomicRuntimeInbound) Type() string                         { return "test" }
+func (f *nonAtomicRuntimeInbound) Tag() string                          { return f.tag }
+func (f *nonAtomicRuntimeInbound) SnapshotRuntimeUsers() []adapter.RuntimeUser {
+	return nil
+}
+func (f *nonAtomicRuntimeInbound) UpsertRuntimeUsers(users []adapter.RuntimeUser) (int, error) {
+	return len(users), nil
+}
+func (f *nonAtomicRuntimeInbound) DeleteRuntimeUsers(principals []string) (int, error) {
 	return len(principals), nil
 }
 
@@ -60,9 +148,7 @@ type fakeInboundManager struct {
 }
 
 func newFakeInboundManager(inbounds ...adapter.Inbound) *fakeInboundManager {
-	result := &fakeInboundManager{
-		inbounds: make(map[string]adapter.Inbound, len(inbounds)),
-	}
+	result := &fakeInboundManager{inbounds: make(map[string]adapter.Inbound, len(inbounds))}
 	for _, inbound := range inbounds {
 		result.inbounds[inbound.Tag()] = inbound
 	}
@@ -80,14 +166,12 @@ func (m *fakeInboundManager) Inbounds() []adapter.Inbound {
 	}
 	return result
 }
-
 func (m *fakeInboundManager) Get(tag string) (adapter.Inbound, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	inbound, loaded := m.inbounds[tag]
 	return inbound, loaded
 }
-
 func (m *fakeInboundManager) Remove(tag string) error { return nil }
 func (m *fakeInboundManager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, inboundType string, options any) error {
 	return nil
@@ -101,16 +185,11 @@ type fakeTracker struct {
 
 func newFakeTracker(principal string) *fakeTracker {
 	id, _ := uuid.NewV4()
-	return &fakeTracker{
-		metadata: trafficontrol.TrackerMetadata{
-			ID: id,
-			Metadata: adapter.InboundContext{
-				User: principal,
-			},
-			Upload:   &atomic.Int64{},
-			Download: &atomic.Int64{},
-		},
-	}
+	return &fakeTracker{metadata: trafficontrol.TrackerMetadata{
+		ID:       id,
+		Metadata: adapter.InboundContext{User: principal},
+		Upload:   &atomic.Int64{}, Download: &atomic.Int64{},
+	}}
 }
 
 func (t *fakeTracker) Metadata() *trafficontrol.TrackerMetadata { return &t.metadata }
@@ -120,514 +199,724 @@ func (t *fakeTracker) Close() error {
 	return nil
 }
 
-func newRuntimeTestServer(inboundManager adapter.InboundManager) (*trafficontrol.Manager, *httptest.Server) {
+type runtimeTestStatus struct {
+	ProtocolVersion   string                  `json:"protocol_version"`
+	DigestVersion     string                  `json:"digest_version"`
+	Ready             bool                    `json:"ready"`
+	RuntimeInstanceID string                  `json:"runtime_instance_id"`
+	Capabilities      []string                `json:"capabilities"`
+	Users             runtimeDomainTestStatus `json:"users"`
+	Policy            runtimeDomainTestStatus `json:"policy"`
+	Disconnect        runtimeDomainIdentity   `json:"disconnect"`
+}
+
+type runtimeDomainTestStatus struct {
+	Revision      int64                      `json:"revision"`
+	RequestID     string                     `json:"request_id"`
+	PayloadDigest string                     `json:"payload_digest"`
+	Count         int                        `json:"count"`
+	Digest        string                     `json:"digest"`
+	Inbounds      []runtimeInboundUserStatus `json:"inbounds"`
+}
+
+type runtimeTestServer struct {
+	traffic  *trafficontrol.Manager
+	server   *httptest.Server
+	instance string
+}
+
+func newRuntimeTestServer(t *testing.T, inboundManager adapter.InboundManager) *runtimeTestServer {
+	t.Helper()
 	trafficManager := trafficontrol.NewManager()
 	server := httptest.NewServer(runtimeRouter(trafficManager, inboundManager))
-	return trafficManager, server
+	status := fetchRuntimeStatus(t, server.URL)
+	return &runtimeTestServer{traffic: trafficManager, server: server, instance: status.RuntimeInstanceID}
 }
 
-func TestRuntimeUsersBadRequest(t *testing.T) {
+func (s *runtimeTestServer) Close() { s.server.Close() }
+
+func TestRuntimeStatusAdvertisesOnlyV3AuthorityCapabilities(t *testing.T) {
 	t.Parallel()
 
-	_, server := newRuntimeTestServer(newFakeInboundManager())
-	defer server.Close()
+	first := newRuntimeTestServer(t, newFakeInboundManager(&fakeRuntimeInbound{tag: "vless-in"}))
+	defer first.Close()
+	second := newRuntimeTestServer(t, newFakeInboundManager(&fakeRuntimeInbound{tag: "vless-in"}))
+	defer second.Close()
 
-	req, _ := http.NewRequest(http.MethodPut, server.URL+"/users", bytes.NewBufferString("{"))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
+	status := fetchRuntimeStatus(t, first.server.URL)
+	if status.ProtocolVersion != runtimeSchemaVersion || status.DigestVersion != runtimeDigestVersion || !status.Ready {
+		t.Fatalf("unexpected runtime status: %+v", status)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("unexpected status: %d", resp.StatusCode)
+	if status.RuntimeInstanceID == "" || status.RuntimeInstanceID == second.instance {
+		t.Fatalf("runtime instance IDs must be non-empty and process-local: first=%q second=%q", status.RuntimeInstanceID, second.instance)
+	}
+	for _, capability := range []string{
+		"runtime_users_authoritative_replace",
+		"runtime_policy_authoritative_replace",
+		"runtime_disconnect_fence",
+		"runtime_disconnect_selectors",
+		"runtime_disconnect_all",
+		"runtime_request_payload_digest",
+		"runtime_state_digest",
+		"runtime_policy_zero_delete",
+	} {
+		if !containsString(status.Capabilities, capability) {
+			t.Fatalf("missing v3 capability %q in %v", capability, status.Capabilities)
+		}
+	}
+	for _, forbidden := range []string{"runtime_users_replace_managed", "runtime_users_batch_upsert"} {
+		if containsString(status.Capabilities, forbidden) {
+			t.Fatalf("legacy capability must not be advertised: %s", forbidden)
+		}
+	}
+	if status.Users.Digest != digestJSON([]canonicalRuntimeUser{}) || status.Policy.Digest != digestPolicies(nil) {
+		t.Fatalf("empty state digests are not canonical: %+v", status)
 	}
 }
 
-func TestRuntimeUsersInboundNotFound(t *testing.T) {
-	t.Parallel()
-
-	_, server := newRuntimeTestServer(newFakeInboundManager())
-	defer server.Close()
-
-	payload := `{"revision":1,"operations":[{"inbound":"missing","upsert":[{"principal":"u1:d1","uuid":"11111111-1111-1111-1111-111111111111"}]}]}`
-	req, _ := http.NewRequest(http.MethodPut, server.URL+"/users", bytes.NewBufferString(payload))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("unexpected status: %d", resp.StatusCode)
-	}
-}
-
-func TestRuntimeUsersRevisionAndIdempotent(t *testing.T) {
-	t.Parallel()
-
-	inbound := &fakeRuntimeInbound{tag: "vless-in"}
-	_, server := newRuntimeTestServer(newFakeInboundManager(inbound))
-	defer server.Close()
-
-	newPayload := `{"revision":10,"request_id":"req-1","operations":[{"inbound":"vless-in","upsert":[{"principal":"u1:d1","uuid":"11111111-1111-1111-1111-111111111111"}]}]}`
-	newReq, _ := http.NewRequest(http.MethodPut, server.URL+"/users", bytes.NewBufferString(newPayload))
-	newReq.Header.Set("Content-Type", "application/json")
-	newResp, err := http.DefaultClient.Do(newReq)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	defer newResp.Body.Close()
-	if newResp.StatusCode != http.StatusOK {
-		t.Fatalf("unexpected status for new revision: %d", newResp.StatusCode)
-	}
-
-	stalePayload := `{"revision":9,"request_id":"req-2","operations":[{"inbound":"vless-in","upsert":[{"principal":"u1:d2","uuid":"22222222-2222-2222-2222-222222222222"}]}]}`
-	staleReq, _ := http.NewRequest(http.MethodPut, server.URL+"/users", bytes.NewBufferString(stalePayload))
-	staleReq.Header.Set("Content-Type", "application/json")
-	staleResp, err := http.DefaultClient.Do(staleReq)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	defer staleResp.Body.Close()
-	if staleResp.StatusCode != http.StatusOK {
-		t.Fatalf("unexpected status for stale revision: %d", staleResp.StatusCode)
-	}
-	var staleBody map[string]any
-	if err := json.NewDecoder(staleResp.Body).Decode(&staleBody); err != nil {
-		t.Fatalf("decode stale response: %v", err)
-	}
-	if staleBody["rejected"] != "stale_revision" {
-		t.Fatalf("expected stale rejection, got=%v", staleBody)
-	}
-
-	idemReq, _ := http.NewRequest(http.MethodPut, server.URL+"/users", bytes.NewBufferString(newPayload))
-	idemReq.Header.Set("Content-Type", "application/json")
-	idemResp, err := http.DefaultClient.Do(idemReq)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	defer idemResp.Body.Close()
-	if idemResp.StatusCode != http.StatusOK {
-		t.Fatalf("unexpected status for idempotent request: %d", idemResp.StatusCode)
-	}
-	var idemBody map[string]any
-	if err := json.NewDecoder(idemResp.Body).Decode(&idemBody); err != nil {
-		t.Fatalf("decode idempotent response: %v", err)
-	}
-	if idemBody["idempotent"] != true {
-		t.Fatalf("expected idempotent response, got=%v", idemBody)
-	}
-	if inbound.upsertInvoked != 1 {
-		t.Fatalf("expected one upsert invocation, got=%d", inbound.upsertInvoked)
-	}
-}
-
-func TestRuntimeUsersUpsertNameAlias(t *testing.T) {
+func TestRuntimeRejectsLegacyMutationShapes(t *testing.T) {
 	t.Parallel()
 
 	inbound := &fakeRuntimeInbound{tag: "vless-in"}
-	_, server := newRuntimeTestServer(newFakeInboundManager(inbound))
-	defer server.Close()
+	harness := newRuntimeTestServer(t, newFakeInboundManager(inbound))
+	defer harness.Close()
 
-	payload := `{"revision":1,"operations":[{"inbound":"vless-in","upsert":[{"name":"u1:d1","uuid":"11111111-1111-1111-1111-111111111111"}]}]}`
-	req, _ := http.NewRequest(http.MethodPut, server.URL+"/users", bytes.NewBufferString(payload))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
+	legacyUsers := `{"revision":1,"request_id":"legacy","operations":[{"inbound":"vless-in","upsert":[]}]}`
+	body := runtimeJSONRequest(t, http.MethodPut, harness.server.URL+"/users", legacyUsers, http.StatusBadRequest)
+	if codeFromBody(t, body) == "" || inbound.commitCount != 0 {
+		t.Fatalf("legacy users request was not rejected safely: body=%s commits=%d", body, inbound.commitCount)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("unexpected status: %d", resp.StatusCode)
+
+	request := applyUsersRequest{
+		runtimeEnvelope: runtimeEnvelope{SchemaVersion: runtimeSchemaVersion, ExpectedRuntimeInstanceID: harness.instance, Revision: 1, RequestID: "replace-managed"},
+		Mode:            "delta", ReplaceManaged: json.RawMessage("true"),
+		Operations: []usersOperation{{Inbound: "vless-in", Upsert: []adapter.RuntimeUser{}}},
 	}
-	if len(inbound.lastUpsert) != 1 {
-		t.Fatalf("expected one upsert user, got=%d", len(inbound.lastUpsert))
+	request.PayloadDigest = digestJSON(canonicalUsersAction{
+		SchemaVersion: runtimeSchemaVersion, ExpectedRuntimeInstanceID: harness.instance, Revision: 1, Mode: "delta",
+		Operations: []usersOperation{{Inbound: "vless-in", Upsert: []adapter.RuntimeUser{}, Delete: []string{}}},
+	})
+	body = runtimeJSONRequest(t, http.MethodPut, harness.server.URL+"/users", mustJSON(t, request), http.StatusBadRequest)
+	if !strings.Contains(string(body), "replace_managed") {
+		t.Fatalf("replace_managed rejection is not explicit: %s", body)
 	}
-	if inbound.lastUpsert[0].Principal != "u1:d1" {
-		t.Fatalf("expected principal mapped from name, got=%q", inbound.lastUpsert[0].Principal)
+
+	legacyPolicy := fmt.Sprintf(`{"schema_version":%q,"expected_runtime_instance_id":%q,"revision":1,"request_id":"legacy-policy","payload_digest":"%s","mode":"delta","replace":true,"policies":[]}`,
+		runtimeSchemaVersion, harness.instance, strings.Repeat("0", 64))
+	body = runtimeJSONRequest(t, http.MethodPut, harness.server.URL+"/policy", legacyPolicy, http.StatusBadRequest)
+	if !strings.Contains(string(body), "replace is not supported") {
+		t.Fatalf("replace rejection is not explicit: %s", body)
+	}
+
+	nullReplaceManaged := fmt.Sprintf(`{"schema_version":%q,"expected_runtime_instance_id":%q,"revision":1,"request_id":"null-replace-managed","payload_digest":"%s","mode":"delta","replace_managed":null,"operations":[{"inbound":"vless-in","upsert":[],"delete":[]}]}`,
+		runtimeSchemaVersion, harness.instance, strings.Repeat("0", 64))
+	body = runtimeJSONRequest(t, http.MethodPut, harness.server.URL+"/users", nullReplaceManaged, http.StatusBadRequest)
+	if !strings.Contains(string(body), "replace_managed is not supported") {
+		t.Fatalf("replace_managed:null must still be rejected explicitly: %s", body)
+	}
+
+	nullReplacePolicy := fmt.Sprintf(`{"schema_version":%q,"expected_runtime_instance_id":%q,"revision":1,"request_id":"null-replace","payload_digest":"%s","mode":"delta","replace":null,"policies":[]}`,
+		runtimeSchemaVersion, harness.instance, strings.Repeat("0", 64))
+	body = runtimeJSONRequest(t, http.MethodPut, harness.server.URL+"/policy", nullReplacePolicy, http.StatusBadRequest)
+	if !strings.Contains(string(body), "replace is not supported") {
+		t.Fatalf("replace:null must still be rejected explicitly: %s", body)
 	}
 }
 
-func TestRuntimeUsersReplaceManagedPreservesStaticUsersAndStableDigest(t *testing.T) {
+func TestRuntimeUsersAuthoritativeReplacePreservesStaticAndCoversAllInbounds(t *testing.T) {
 	t.Parallel()
 
 	staticUUID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
-	inbound := &fakeRuntimeInbound{
-		tag: "vless-in",
-		snapshot: []adapter.RuntimeUser{{
-			Principal: "static-admin",
-			UUID:      staticUUID,
-		}},
-	}
-	_, server := newRuntimeTestServer(newFakeInboundManager(inbound))
-	defer server.Close()
+	first := &fakeRuntimeInbound{tag: "vless-in", snapshot: []adapter.RuntimeUser{{Principal: "static-admin", UUID: staticUUID}}}
+	second := &fakeRuntimeInbound{tag: "vmess-in"}
+	harness := newRuntimeTestServer(t, newFakeInboundManager(second, first))
+	defer harness.Close()
 
-	applyRuntimePayload(t, server.URL, `{
-		"revision":1,
-		"request_id":"seed-managed",
-		"operations":[{"inbound":"vless-in","upsert":[
-			{"principal":"static-admin","uuid":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"},
-			{"principal":"u1:d1","uuid":"11111111-1111-1111-1111-111111111111"}
-		]}]
-	}`)
-	applyRuntimePayload(t, server.URL, `{
-		"revision":2,
-		"request_id":"replace-managed-1",
-		"replace_managed":true,
-		"operations":[{"inbound":"vless-in","upsert":[
-			{"principal":"u3:d1","uuid":"33333333-3333-3333-3333-333333333333"},
-			{"principal":"u2:d1","uuid":"22222222-2222-2222-2222-222222222222"}
-		]}]
-	}`)
-
-	if len(inbound.lastDelete) != 1 || inbound.lastDelete[0] != "u1:d1" {
-		t.Fatalf("replace_managed must delete only stale managed users, got=%v", inbound.lastDelete)
+	request := usersRequest(t, harness.instance, 10, "users-recovery-10", "authoritative_replace", "all_runtime_inbounds", []usersOperation{
+		{Inbound: "vmess-in", Upsert: []adapter.RuntimeUser{}},
+		{Inbound: "vless-in", Upsert: []adapter.RuntimeUser{{Principal: "u1:d1", UUID: "11111111-1111-1111-1111-111111111111"}}},
+	})
+	body := runtimeJSONRequest(t, http.MethodPut, harness.server.URL+"/users", mustJSON(t, request), http.StatusOK)
+	var response runtimeDomainTestStatus
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatalf("decode users response: %v", err)
 	}
-	upsertByPrincipal := make(map[string]adapter.RuntimeUser)
-	for _, runtimeUser := range inbound.lastUpsert {
-		upsertByPrincipal[runtimeUser.Principal] = runtimeUser
+	if response.Revision != 10 || response.RequestID != "users-recovery-10" || response.Count != 1 || len(response.Digest) != 64 {
+		t.Fatalf("unexpected users response: %s", body)
 	}
-	if restored, found := upsertByPrincipal["static-admin"]; !found || restored.UUID != staticUUID {
-		t.Fatalf("expected original static user restored, got=%+v found=%v", restored, found)
+	if first.commitCount != 1 || second.commitCount != 1 {
+		t.Fatalf("each inbound must commit once: first=%d second=%d", first.commitCount, second.commitCount)
 	}
-	if _, found := upsertByPrincipal["u2:d1"]; !found {
-		t.Fatal("expected desired managed user u2:d1")
+	actual := runtimeUserMap(first.lastReplace)
+	if actual["static-admin"].UUID != staticUUID || actual["u1:d1"].UUID == "" {
+		t.Fatalf("static and managed users were not merged correctly: %+v", actual)
 	}
-	if _, found := upsertByPrincipal["u3:d1"]; !found {
-		t.Fatal("expected desired managed user u3:d1")
+	status := fetchRuntimeStatus(t, harness.server.URL)
+	if status.Users.Revision != 10 || status.Users.Count != 1 || len(status.Users.Inbounds) != 2 {
+		t.Fatalf("status did not expose actual managed state: %+v", status.Users)
 	}
-
-	firstStatusBody := getRuntimeStatusBody(t, server.URL)
-	var firstStatus struct {
-		RuntimeInstanceID string `json:"runtime_instance_id"`
-		UserCount         int    `json:"user_count"`
-		UserDigest        string `json:"user_digest"`
-		UserState         []struct {
-			Inbound string `json:"inbound"`
-			Count   int    `json:"count"`
-			Digest  string `json:"digest"`
-		} `json:"user_state"`
-	}
-	if err := json.Unmarshal(firstStatusBody, &firstStatus); err != nil {
-		t.Fatalf("decode runtime status: %v", err)
-	}
-	if firstStatus.RuntimeInstanceID == "" || firstStatus.UserCount != 2 || len(firstStatus.UserDigest) != 64 {
-		t.Fatalf("unexpected runtime status: %+v", firstStatus)
-	}
-	if len(firstStatus.UserState) != 1 || firstStatus.UserState[0].Inbound != "vless-in" || firstStatus.UserState[0].Count != 2 {
-		t.Fatalf("unexpected inbound user state: %+v", firstStatus.UserState)
-	}
-	for _, secret := range []string{staticUUID, "22222222-2222-2222-2222-222222222222", "33333333-3333-3333-3333-333333333333"} {
-		if bytes.Contains(firstStatusBody, []byte(secret)) {
+	statusBody := runtimeJSONRequest(t, http.MethodGet, harness.server.URL+"/status", "", http.StatusOK)
+	for _, secret := range []string{staticUUID, "11111111-1111-1111-1111-111111111111"} {
+		if bytes.Contains(statusBody, []byte(secret)) {
 			t.Fatalf("runtime status leaked credential %s", secret)
 		}
 	}
 
-	applyRuntimePayload(t, server.URL, `{
-		"revision":3,
-		"request_id":"replace-managed-2",
-		"replace_managed":true,
-		"operations":[{"inbound":"vless-in","upsert":[
-			{"principal":"u2:d1","uuid":"22222222-2222-2222-2222-222222222222"},
-			{"principal":"u3:d1","uuid":"33333333-3333-3333-3333-333333333333"}
-		]}]
-	}`)
-	secondStatusBody := getRuntimeStatusBody(t, server.URL)
-	var secondStatus struct {
-		RuntimeInstanceID string `json:"runtime_instance_id"`
-		UserDigest        string `json:"user_digest"`
+	omitted := usersRequest(t, harness.instance, 11, "users-omitted", "authoritative_replace", "all_runtime_inbounds", []usersOperation{
+		{Inbound: "vless-in", Upsert: []adapter.RuntimeUser{}},
+	})
+	body = runtimeJSONRequest(t, http.MethodPut, harness.server.URL+"/users", mustJSON(t, omitted), http.StatusUnprocessableEntity)
+	if codeFromBody(t, body) != runtimeErrorUnsupportedInbound || first.commitCount != 1 || second.commitCount != 1 {
+		t.Fatalf("omitted inbound must fail before commit: body=%s first=%d second=%d", body, first.commitCount, second.commitCount)
 	}
-	if err := json.Unmarshal(secondStatusBody, &secondStatus); err != nil {
-		t.Fatalf("decode second runtime status: %v", err)
+
+	empty := usersRequest(t, harness.instance, 12, "users-drain-12", "authoritative_replace", "all_runtime_inbounds", []usersOperation{
+		{Inbound: "vless-in", Upsert: []adapter.RuntimeUser{}},
+		{Inbound: "vmess-in", Upsert: []adapter.RuntimeUser{}},
+	})
+	_ = runtimeJSONRequest(t, http.MethodPut, harness.server.URL+"/users", mustJSON(t, empty), http.StatusOK)
+	status = fetchRuntimeStatus(t, harness.server.URL)
+	if status.Users.Revision != 12 || status.Users.Count != 0 || status.Users.Digest != digestJSON([]canonicalRuntimeUser{}) {
+		t.Fatalf("authoritative empty snapshot did not clear controlled state: %+v", status.Users)
 	}
-	if secondStatus.RuntimeInstanceID != firstStatus.RuntimeInstanceID || secondStatus.UserDigest != firstStatus.UserDigest {
-		t.Fatalf("expected stable instance and order-independent digest: first=%+v second=%+v", firstStatus, secondStatus)
+	actual = runtimeUserMap(first.lastReplace)
+	if len(actual) != 1 || actual["static-admin"].UUID != staticUUID || len(second.lastReplace) != 0 {
+		t.Fatalf("empty controlled snapshot did not preserve only static users: first=%+v second=%+v", actual, second.lastReplace)
 	}
 }
 
-func TestRuntimeDisconnectBatchIsIdempotent(t *testing.T) {
+func TestRuntimeUsersMultiInboundPrepareFailureHasNoPartialCommit(t *testing.T) {
 	t.Parallel()
 
-	trafficManager, server := newRuntimeTestServer(newFakeInboundManager())
-	defer server.Close()
+	first := &fakeRuntimeInbound{tag: "a-in"}
+	second := &fakeRuntimeInbound{tag: "b-in", prepareError: errors.New("invalid credential")}
+	harness := newRuntimeTestServer(t, newFakeInboundManager(first, second))
+	defer harness.Close()
+
+	request := usersRequest(t, harness.instance, 1, "atomic-failure", "authoritative_replace", "all_runtime_inbounds", []usersOperation{
+		{Inbound: "b-in", Upsert: []adapter.RuntimeUser{{Principal: "u2:d1", UUID: "22222222-2222-2222-2222-222222222222"}}},
+		{Inbound: "a-in", Upsert: []adapter.RuntimeUser{{Principal: "u1:d1", UUID: "11111111-1111-1111-1111-111111111111"}}},
+	})
+	body := runtimeJSONRequest(t, http.MethodPut, harness.server.URL+"/users", mustJSON(t, request), http.StatusUnprocessableEntity)
+	if codeFromBody(t, body) != "invalid_request" {
+		t.Fatalf("unexpected prepare error: %s", body)
+	}
+	if first.prepareCount != 1 || first.abortCount != 1 || first.commitCount != 0 || second.commitCount != 0 {
+		t.Fatalf("prepared inbounds were not aborted without commit: first=%+v second=%+v", first, second)
+	}
+	status := fetchRuntimeStatus(t, harness.server.URL)
+	if status.Users.Revision != 0 || status.Users.Count != 0 {
+		t.Fatalf("failed multi-inbound replace advanced users state: %+v", status.Users)
+	}
+}
+
+func TestRuntimeUsersMultiInboundAppliesAllBeforeReleasingReaders(t *testing.T) {
+	t.Parallel()
+
+	secondApplyStarted := make(chan struct{})
+	continueSecondApply := make(chan struct{})
+	first := &fakeRuntimeInbound{tag: "a-in"}
+	second := &fakeRuntimeInbound{
+		tag: "b-in", applyStarted: secondApplyStarted, applyContinue: continueSecondApply,
+	}
+	harness := newRuntimeTestServer(t, newFakeInboundManager(first, second))
+	defer harness.Close()
+	request := usersRequest(t, harness.instance, 1, "atomic-release", "authoritative_replace", "all_runtime_inbounds", []usersOperation{
+		{Inbound: "a-in", Upsert: []adapter.RuntimeUser{{Principal: "u1:d1", UUID: "11111111-1111-1111-1111-111111111111"}}},
+		{Inbound: "b-in", Upsert: []adapter.RuntimeUser{{Principal: "u2:d1", UUID: "22222222-2222-2222-2222-222222222222"}}},
+	})
+	payload := mustJSON(t, request)
+
+	type httpResult struct {
+		status int
+		body   []byte
+		err    error
+	}
+	httpResultChannel := make(chan httpResult, 1)
+	go func() {
+		httpRequest, err := http.NewRequest(http.MethodPut, harness.server.URL+"/users", strings.NewReader(payload))
+		if err != nil {
+			httpResultChannel <- httpResult{err: err}
+			return
+		}
+		httpRequest.Header.Set("Content-Type", "application/json")
+		response, err := http.DefaultClient.Do(httpRequest)
+		if err != nil {
+			httpResultChannel <- httpResult{err: err}
+			return
+		}
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		httpResultChannel <- httpResult{status: response.StatusCode, body: body, err: err}
+	}()
+
+	select {
+	case <-secondApplyStarted:
+	case <-time.After(2 * time.Second):
+		close(continueSecondApply)
+		t.Fatal("second inbound did not enter apply")
+	}
+	readerDone := make(chan []adapter.RuntimeUser, 1)
+	go func() { readerDone <- first.SnapshotRuntimeUsers() }()
+	select {
+	case users := <-readerDone:
+		close(continueSecondApply)
+		t.Fatalf("first inbound became observable before all inbounds applied: %+v", users)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(continueSecondApply)
+
+	result := <-httpResultChannel
+	if result.err != nil || result.status != http.StatusOK {
+		t.Fatalf("authoritative replace failed: status=%d err=%v body=%s", result.status, result.err, result.body)
+	}
+	select {
+	case users := <-readerDone:
+		if len(users) != 1 || users[0].Principal != "u1:d1" {
+			t.Fatalf("reader did not observe the final snapshot: %+v", users)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first inbound reader remained blocked after release")
+	}
+	if first.releaseCount != 1 || second.releaseCount != 1 || first.commitCount != 1 || second.commitCount != 1 {
+		t.Fatalf("unexpected three-phase counts: first=%+v second=%+v", first, second)
+	}
+}
+
+func TestRuntimeUsersIdempotencyAndConflictMatrix(t *testing.T) {
+	t.Parallel()
+
+	inbound := &fakeRuntimeInbound{tag: "vless-in"}
+	harness := newRuntimeTestServer(t, newFakeInboundManager(inbound))
+	defer harness.Close()
+
+	base := usersRequest(t, harness.instance, 10, "users-10", "delta", "", []usersOperation{{
+		Inbound: "vless-in", Upsert: []adapter.RuntimeUser{{Principal: "u1:d1", UUID: "11111111-1111-1111-1111-111111111111"}},
+	}})
+	firstBody := runtimeJSONRequest(t, http.MethodPut, harness.server.URL+"/users", mustJSON(t, base), http.StatusOK)
+	secondBody := runtimeJSONRequest(t, http.MethodPut, harness.server.URL+"/users", mustJSON(t, base), http.StatusOK)
+	if !boolFromBody(t, secondBody, "idempotent") || inbound.commitCount != 1 {
+		t.Fatalf("same request retry was not idempotent: first=%s second=%s commits=%d", firstBody, secondBody, inbound.commitCount)
+	}
+
+	alias := base
+	alias.RequestID = "users-10-alias"
+	aliasBody := runtimeJSONRequest(t, http.MethodPut, harness.server.URL+"/users", mustJSON(t, alias), http.StatusOK)
+	if !boolFromBody(t, aliasBody, "idempotent") || stringFromBody(t, aliasBody, "digest") == "" || inbound.commitCount != 1 {
+		t.Fatalf("equal revision/digest alias did not return the complete result: %s", aliasBody)
+	}
+
+	requestConflict := usersRequest(t, harness.instance, 11, "users-10", "delta", "", []usersOperation{{
+		Inbound: "vless-in", Upsert: []adapter.RuntimeUser{{Principal: "u2:d1", UUID: "22222222-2222-2222-2222-222222222222"}},
+	}})
+	assertRuntimeError(t, harness.server.URL+"/users", mustJSON(t, requestConflict), http.StatusConflict, runtimeErrorRequestConflict)
+
+	revisionConflict := usersRequest(t, harness.instance, 10, "users-revision-conflict", "delta", "", []usersOperation{{
+		Inbound: "vless-in", Delete: []string{"u1:d1"},
+	}})
+	conflictBody := runtimeJSONRequest(t, http.MethodPut, harness.server.URL+"/users", mustJSON(t, revisionConflict), http.StatusConflict)
+	if codeFromBody(t, conflictBody) != runtimeErrorRevisionConflict || intFromBody(t, conflictBody, "current_revision") != 10 || stringFromBody(t, conflictBody, "current_request_id") != "users-10" {
+		t.Fatalf("conflict evidence did not expose current domain identity: %s", conflictBody)
+	}
+
+	stale := usersRequest(t, harness.instance, 9, "users-stale", "delta", "", []usersOperation{{Inbound: "vless-in", Delete: []string{"u1:d1"}}})
+	assertRuntimeError(t, harness.server.URL+"/users", mustJSON(t, stale), http.StatusConflict, runtimeErrorStaleRevision)
+
+	digestMismatch := usersRequest(t, harness.instance, 11, "users-digest", "delta", "", []usersOperation{{Inbound: "vless-in", Delete: []string{"u1:d1"}}})
+	digestMismatch.PayloadDigest = strings.Repeat("0", 64)
+	assertRuntimeError(t, harness.server.URL+"/users", mustJSON(t, digestMismatch), http.StatusUnprocessableEntity, runtimeErrorDigestMismatch)
+
+	wrongInstance := usersRequest(t, "old-runtime-instance", 11, "users-old-instance", "delta", "", []usersOperation{{Inbound: "vless-in", Delete: []string{"u1:d1"}}})
+	assertRuntimeError(t, harness.server.URL+"/users", mustJSON(t, wrongInstance), http.StatusConflict, runtimeErrorInstanceMismatch)
+
+	unsupported := usersRequest(t, harness.instance, 11, "users-missing", "delta", "", []usersOperation{{Inbound: "missing", Delete: []string{"u1:d1"}}})
+	assertRuntimeError(t, harness.server.URL+"/users", mustJSON(t, unsupported), http.StatusUnprocessableEntity, runtimeErrorUnsupportedInbound)
+
+	status := fetchRuntimeStatus(t, harness.server.URL)
+	if status.Users.Revision != 10 || status.Users.RequestID != "users-10" || inbound.commitCount != 1 {
+		t.Fatalf("failed/idempotent requests changed the applied identity: status=%+v commits=%d", status.Users, inbound.commitCount)
+	}
+}
+
+func TestRuntimePolicyAuthoritativeAndZeroDelete(t *testing.T) {
+	t.Parallel()
+
+	harness := newRuntimeTestServer(t, newFakeInboundManager(&fakeRuntimeInbound{tag: "vless-in"}))
+	defer harness.Close()
+
+	replace := policyRequest(t, harness.instance, 20, "policy-20", "authoritative_replace", []trafficontrol.PrincipalPolicy{
+		{Principal: "u2:*", UpBPS: 200}, {Principal: "u1:d1", DownBPS: 100},
+	})
+	body := runtimeJSONRequest(t, http.MethodPut, harness.server.URL+"/policy", mustJSON(t, replace), http.StatusOK)
+	if intFromBody(t, body, "count") != 2 {
+		t.Fatalf("unexpected policy replace response: %s", body)
+	}
+
+	zeroDelete := policyRequest(t, harness.instance, 21, "policy-21", "delta", []trafficontrol.PrincipalPolicy{{Principal: "u1:d1"}})
+	_ = runtimeJSONRequest(t, http.MethodPut, harness.server.URL+"/policy", mustJSON(t, zeroDelete), http.StatusOK)
+	if _, loaded := harness.traffic.PolicyForPrincipal("u1:d1"); loaded {
+		t.Fatal("all-zero policy delta did not delete the principal")
+	}
+	status := fetchRuntimeStatus(t, harness.server.URL)
+	if status.Policy.Revision != 21 || status.Policy.RequestID != "policy-21" || status.Policy.Count != 1 {
+		t.Fatalf("unexpected policy status after zero-delete: %+v", status.Policy)
+	}
+	snapshotBody := runtimeJSONRequest(t, http.MethodGet, harness.server.URL+"/policy/snapshot", "", http.StatusOK)
+	if intFromBody(t, snapshotBody, "count") != 1 || stringFromBody(t, snapshotBody, "payload_digest") != status.Policy.PayloadDigest {
+		t.Fatalf("policy snapshot identity does not match status: snapshot=%s status=%+v", snapshotBody, status.Policy)
+	}
+}
+
+func TestRuntimeDisconnectFenceSelectorsAllAndIdempotency(t *testing.T) {
+	t.Parallel()
+
+	inbound := &fakeRuntimeInbound{tag: "vless-in"}
+	harness := newRuntimeTestServer(t, newFakeInboundManager(inbound))
+	defer harness.Close()
+
+	users := usersRequest(t, harness.instance, 30, "users-30", "delta", "", []usersOperation{{Inbound: "vless-in", Upsert: []adapter.RuntimeUser{}}})
+	_ = runtimeJSONRequest(t, http.MethodPut, harness.server.URL+"/users", mustJSON(t, users), http.StatusOK)
+	policy := policyRequest(t, harness.instance, 30, "policy-30", "authoritative_replace", nil)
+	_ = runtimeJSONRequest(t, http.MethodPut, harness.server.URL+"/policy", mustJSON(t, policy), http.StatusOK)
 
 	user := newFakeTracker("u1:d1")
-	bareUser := newFakeTracker("u1")
 	exact := newFakeTracker("u2:d1")
 	other := newFakeTracker("u3:d1")
-	for _, tracker := range []*fakeTracker{user, bareUser, exact, other} {
-		trafficManager.Join(tracker)
+	for _, tracker := range []*fakeTracker{user, exact, other} {
+		harness.traffic.Join(tracker)
 	}
-	payload := `{"request_id":"disconnect-batch-1","user_ids":["u1","u1"],"principals":["u2:d1","u2:d1"]}`
-	responseBody := runtimeJSONRequest(t, http.MethodPost, server.URL+"/disconnect", payload, http.StatusOK)
-	var response disconnectPrincipalResponse
-	if err := json.Unmarshal(responseBody, &response); err != nil {
-		t.Fatalf("decode disconnect response: %v", err)
-	}
-	if response.SelectorCount != 2 || response.Disconnected != 3 || response.Idempotent {
-		t.Fatalf("unexpected disconnect response: %+v", response)
-	}
-	if other.closed.Load() {
-		t.Fatal("unexpected close for unmatched tracker")
+	disconnect := disconnectRequest(t, harness.instance, 30, "disconnect-30", runtimeFence{UsersRevision: 30, PolicyRevision: 30}, &runtimeSelectors{
+		UserIDs: []string{"u1", "u1"}, Principals: []string{"u2:d1", "u2:d1"},
+	}, false)
+	body := runtimeJSONRequest(t, http.MethodPost, harness.server.URL+"/disconnect", mustJSON(t, disconnect), http.StatusOK)
+	if intFromBody(t, body, "selector_count") != 2 || intFromBody(t, body, "disconnected") != 2 || other.closed.Load() {
+		t.Fatalf("unexpected selector disconnect: %s", body)
 	}
 
 	late := newFakeTracker("u1:d2")
-	trafficManager.Join(late)
-	secondBody := runtimeJSONRequest(t, http.MethodPost, server.URL+"/disconnect", payload, http.StatusOK)
-	var second disconnectPrincipalResponse
-	if err := json.Unmarshal(secondBody, &second); err != nil {
-		t.Fatalf("decode idempotent response: %v", err)
+	harness.traffic.Join(late)
+	replay := runtimeJSONRequest(t, http.MethodPost, harness.server.URL+"/disconnect", mustJSON(t, disconnect), http.StatusOK)
+	if !boolFromBody(t, replay, "idempotent") || late.closed.Load() {
+		t.Fatalf("idempotent disconnect rescanned connections: %s", replay)
 	}
-	if !second.Idempotent || second.Disconnected != 3 {
-		t.Fatalf("expected cached disconnect response, got %+v", second)
+
+	unreached := disconnectRequest(t, harness.instance, 31, "disconnect-unreached", runtimeFence{UsersRevision: 31, PolicyRevision: 31}, nil, true)
+	assertRuntimeError(t, harness.server.URL+"/disconnect", mustJSON(t, unreached), http.StatusServiceUnavailable, runtimeErrorNotReady)
+	if other.closed.Load() || late.closed.Load() {
+		t.Fatal("unreached fence disconnected connections")
 	}
-	if late.closed.Load() {
-		t.Fatal("idempotent retry must not rescan and close a later connection")
+
+	users31 := usersRequest(t, harness.instance, 31, "users-31", "delta", "", []usersOperation{{Inbound: "vless-in", Upsert: []adapter.RuntimeUser{}}})
+	_ = runtimeJSONRequest(t, http.MethodPut, harness.server.URL+"/users", mustJSON(t, users31), http.StatusOK)
+	policy31 := policyRequest(t, harness.instance, 31, "policy-31", "authoritative_replace", nil)
+	_ = runtimeJSONRequest(t, http.MethodPut, harness.server.URL+"/policy", mustJSON(t, policy31), http.StatusOK)
+	all := disconnectRequest(t, harness.instance, 31, "disconnect-all-31", runtimeFence{UsersRevision: 31, PolicyRevision: 31}, nil, true)
+	body = runtimeJSONRequest(t, http.MethodPost, harness.server.URL+"/disconnect", mustJSON(t, all), http.StatusOK)
+	if intFromBody(t, body, "disconnected") != 4 || !other.closed.Load() || !late.closed.Load() {
+		t.Fatalf("disconnect all did not close every point-in-time tracker: %s", body)
 	}
-	if user.closes.Load() != 1 || bareUser.closes.Load() != 1 || exact.closes.Load() != 1 {
-		t.Fatalf("expected each original tracker closed once: user=%d bare=%d exact=%d", user.closes.Load(), bareUser.closes.Load(), exact.closes.Load())
+	status := fetchRuntimeStatus(t, harness.server.URL)
+	if status.Disconnect.Revision != 31 || status.Disconnect.RequestID != "disconnect-all-31" {
+		t.Fatalf("disconnect identity missing from status: %+v", status.Disconnect)
 	}
 }
 
-func TestRuntimeDisconnectRejectsMoreThanMaximumSelectors(t *testing.T) {
+func TestRuntimeDisconnectRejectsAmbiguousAndOversizedScopes(t *testing.T) {
 	t.Parallel()
 
-	_, server := newRuntimeTestServer(newFakeInboundManager())
-	defer server.Close()
+	harness := newRuntimeTestServer(t, newFakeInboundManager())
+	defer harness.Close()
+	ambiguous := disconnectPrincipalRequest{
+		runtimeEnvelope: runtimeEnvelope{
+			SchemaVersion: runtimeSchemaVersion, ExpectedRuntimeInstanceID: harness.instance, Revision: 1,
+			RequestID: "ambiguous", PayloadDigest: strings.Repeat("0", 64),
+		},
+		Fence: runtimeFence{}, Selectors: &runtimeSelectors{Principals: []string{"u1:d1"}}, All: true,
+	}
+	body := runtimeJSONRequest(t, http.MethodPost, harness.server.URL+"/disconnect", mustJSON(t, ambiguous), http.StatusBadRequest)
+	if codeFromBody(t, body) != "invalid_request" {
+		t.Fatalf("ambiguous disconnect scope was not rejected: %s", body)
+	}
+
 	principals := make([]string, maxRuntimeDisconnectSelectors+1)
 	for index := range principals {
 		principals[index] = fmt.Sprintf("u%d:d1", index)
 	}
-	payload, err := json.Marshal(map[string]any{"principals": principals})
-	if err != nil {
-		t.Fatalf("marshal selectors: %v", err)
-	}
-	responseBody := runtimeJSONRequest(t, http.MethodPost, server.URL+"/disconnect", string(payload), http.StatusBadRequest)
-	if !strings.Contains(string(responseBody), "too many selectors") {
-		t.Fatalf("unexpected selector limit response: %s", responseBody)
+	oversized := ambiguous
+	oversized.RequestID = "oversized"
+	oversized.All = false
+	oversized.Selectors = &runtimeSelectors{Principals: principals}
+	body = runtimeJSONRequest(t, http.MethodPost, harness.server.URL+"/disconnect", mustJSON(t, oversized), http.StatusBadRequest)
+	if codeFromBody(t, body) != "invalid_request" || !strings.Contains(string(body), "too many selectors") {
+		t.Fatalf("oversized disconnect scope was not rejected: %s", body)
 	}
 }
 
-func TestRuntimeDisconnectByUserIDIncludesWildcard(t *testing.T) {
+func TestRuntimeNotReadyDoesNotAdvanceState(t *testing.T) {
 	t.Parallel()
 
-	trafficManager, server := newRuntimeTestServer(newFakeInboundManager())
+	state := newRuntimeState(trafficontrol.NewManager(), nil)
+	server := httptest.NewServer(runtimeRouter(state.traffic, nil))
 	defer server.Close()
-
-	user := newFakeTracker("u1")
-	device := newFakeTracker("u1:d1")
-	other := newFakeTracker("u2:d1")
-	trafficManager.Join(user)
-	trafficManager.Join(device)
-	trafficManager.Join(other)
-
-	payload := `{"user_id":"u1"}`
-	req, _ := http.NewRequest(http.MethodPost, server.URL+"/disconnect", bytes.NewBufferString(payload))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("unexpected status: %d", resp.StatusCode)
-	}
-
-	if !user.closed.Load() || !device.closed.Load() {
-		t.Fatal("expected both u1 and u1:* closed")
-	}
-	if other.closed.Load() {
-		t.Fatal("unexpected close for other user")
+	status := fetchRuntimeStatus(t, server.URL)
+	request := usersRequest(t, status.RuntimeInstanceID, 1, "not-ready", "delta", "", []usersOperation{{Inbound: "missing"}})
+	assertRuntimeError(t, server.URL+"/users", mustJSON(t, request), http.StatusServiceUnavailable, runtimeErrorNotReady)
+	status = fetchRuntimeStatus(t, server.URL)
+	if status.Users.Revision != 0 {
+		t.Fatalf("not-ready request advanced users state: %+v", status.Users)
 	}
 }
 
-func TestRuntimePolicyRequestIDAndStale(t *testing.T) {
+func TestRuntimeUnsupportedNonAtomicInbound(t *testing.T) {
 	t.Parallel()
 
-	_, server := newRuntimeTestServer(newFakeInboundManager())
-	defer server.Close()
-
-	applyPayload := `{"revision":10,"request_id":"policy-1","replace":false,"policies":[{"principal":"u1:*","max_connections":2}]}`
-	applyReq, _ := http.NewRequest(http.MethodPut, server.URL+"/policy", bytes.NewBufferString(applyPayload))
-	applyReq.Header.Set("Content-Type", "application/json")
-	applyResp, err := http.DefaultClient.Do(applyReq)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
+	inbound := &nonAtomicRuntimeInbound{tag: "legacy-in"}
+	harness := newRuntimeTestServer(t, newFakeInboundManager(inbound))
+	defer harness.Close()
+	if status := fetchRuntimeStatus(t, harness.server.URL); status.Ready {
+		t.Fatalf("Runtime with non-atomic user inbound must not advertise ready: %+v", status)
 	}
-	defer applyResp.Body.Close()
-	if applyResp.StatusCode != http.StatusOK {
-		t.Fatalf("unexpected apply status: %d", applyResp.StatusCode)
-	}
-	var applyBody map[string]any
-	if err := json.NewDecoder(applyResp.Body).Decode(&applyBody); err != nil {
-		t.Fatalf("decode apply response: %v", err)
-	}
-	if applyBody["requestId"] != "policy-1" {
-		t.Fatalf("unexpected requestId: %v", applyBody["requestId"])
-	}
-
-	stalePayload := `{"revision":9,"request_id":"policy-old","replace":false,"policies":[{"principal":"u1:d1","max_connections":1}]}`
-	staleReq, _ := http.NewRequest(http.MethodPut, server.URL+"/policy", bytes.NewBufferString(stalePayload))
-	staleReq.Header.Set("Content-Type", "application/json")
-	staleResp, err := http.DefaultClient.Do(staleReq)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	defer staleResp.Body.Close()
-	if staleResp.StatusCode != http.StatusOK {
-		t.Fatalf("unexpected stale status: %d", staleResp.StatusCode)
-	}
-	var staleBody map[string]any
-	if err := json.NewDecoder(staleResp.Body).Decode(&staleBody); err != nil {
-		t.Fatalf("decode stale response: %v", err)
-	}
-	if staleBody["rejected"] != "stale_revision" {
-		t.Fatalf("expected stale rejection, got=%v", staleBody)
-	}
-	if staleBody["requestId"] != "policy-old" {
-		t.Fatalf("unexpected stale requestId: %v", staleBody["requestId"])
-	}
+	request := usersRequest(t, harness.instance, 1, "unsupported-atomic", "authoritative_replace", "all_runtime_inbounds", []usersOperation{{Inbound: "legacy-in"}})
+	assertRuntimeError(t, harness.server.URL+"/users", mustJSON(t, request), http.StatusServiceUnavailable, runtimeErrorNotReady)
 }
 
-func TestRuntimePolicySnapshotMatchesStatusDigest(t *testing.T) {
+func TestRuntimeWithNoControllableInboundIsNotReady(t *testing.T) {
 	t.Parallel()
 
-	_, server := newRuntimeTestServer(newFakeInboundManager())
-	defer server.Close()
-	policyPayload := `{"revision":12,"request_id":"policy-snapshot","replace":true,"policies":[{"principal":"u2:*","up_bps":200},{"principal":"u1:d1","down_bps":100}]}`
-	_ = runtimeJSONRequest(t, http.MethodPut, server.URL+"/policy", policyPayload, http.StatusOK)
-
-	snapshotBody := runtimeJSONRequest(t, http.MethodGet, server.URL+"/policy/snapshot", "", http.StatusOK)
-	var snapshot struct {
-		Revision int64                           `json:"revision"`
-		Count    int                             `json:"count"`
-		Digest   string                          `json:"digest"`
-		Policies []trafficontrol.PrincipalPolicy `json:"policies"`
+	harness := newRuntimeTestServer(t, newFakeInboundManager())
+	defer harness.Close()
+	status := fetchRuntimeStatus(t, harness.server.URL)
+	if status.Ready {
+		t.Fatalf("Runtime without a controllable inbound must not advertise ready: %+v", status)
 	}
-	if err := json.Unmarshal(snapshotBody, &snapshot); err != nil {
-		t.Fatalf("decode policy snapshot: %v", err)
-	}
-	if snapshot.Revision != 12 || snapshot.Count != 2 || len(snapshot.Digest) != 64 {
-		t.Fatalf("unexpected policy snapshot: %+v", snapshot)
-	}
-	if len(snapshot.Policies) != 2 || snapshot.Policies[0].Principal != "u1:d1" || snapshot.Policies[1].Principal != "u2:*" {
-		t.Fatalf("expected sorted policies, got %+v", snapshot.Policies)
-	}
-
-	statusBody := getRuntimeStatusBody(t, server.URL)
-	var status struct {
-		Ready          bool     `json:"ready"`
-		Capabilities   []string `json:"capabilities"`
-		PolicyRevision int64    `json:"policy_revision"`
-		PolicyCount    int      `json:"policy_count"`
-		PolicyDigest   string   `json:"policy_digest"`
-	}
-	if err := json.Unmarshal(statusBody, &status); err != nil {
-		t.Fatalf("decode runtime status: %v", err)
-	}
-	if !status.Ready || status.PolicyRevision != snapshot.Revision || status.PolicyCount != snapshot.Count || status.PolicyDigest != snapshot.Digest {
-		t.Fatalf("status and snapshot mismatch: status=%+v snapshot=%+v", status, snapshot)
-	}
-	if !containsString(status.Capabilities, "runtime_disconnect_batch") || !containsString(status.Capabilities, "runtime_users_replace_managed") {
-		t.Fatalf("missing runtime v2 capabilities: %v", status.Capabilities)
-	}
+	request := policyRequest(t, harness.instance, 1, "no-inbound-policy", "authoritative_replace", nil)
+	assertRuntimeError(t, harness.server.URL+"/policy", mustJSON(t, request), http.StatusServiceUnavailable, runtimeErrorNotReady)
 }
 
-func TestRuntimeDigestFixtures(t *testing.T) {
+func TestRuntimeCanonicalDigestFixtures(t *testing.T) {
 	t.Parallel()
 
-	emptyPolicyDigest := digestPolicies(nil)
-	if emptyPolicyDigest != "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945" {
-		t.Fatalf("empty policy digest must use canonical JSON array: %s", emptyPolicyDigest)
-	}
-
-	users := map[string]adapter.RuntimeUser{
-		"u1:d1": {
-			Principal: "u1:d1",
-			UUID:      "11111111-1111-1111-1111-111111111111",
-			Flow:      "xtls-rprx-vision",
+	first := applyUsersRequest{
+		runtimeEnvelope: runtimeEnvelope{SchemaVersion: runtimeSchemaVersion, ExpectedRuntimeInstanceID: "instance-1", Revision: 7},
+		Mode:            "authoritative_replace", Scope: "all_runtime_inbounds",
+		Operations: []usersOperation{
+			{Inbound: "vmess-in", Upsert: []adapter.RuntimeUser{}},
+			{Inbound: "vless-in", Upsert: []adapter.RuntimeUser{
+				{Principal: "u2:d1", UUID: "22222222-2222-2222-2222-222222222222"},
+				{Principal: "u1:d1", UUID: "11111111-1111-1111-1111-111111111111", Flow: "xtls-rprx-vision"},
+			}},
 		},
 	}
-	userDigest := digestJSON(canonicalRuntimeUsers("vless-in", users))
-	if userDigest != "76767ee449b634a15a6412e7105c5790032af804bc3e39456b2b2eb2c6a88d9d" {
-		t.Fatalf("unexpected user digest fixture: %s", userDigest)
+	second := first
+	second.Operations = []usersOperation{first.Operations[1], first.Operations[0]}
+	second.Operations[0].Upsert = []adapter.RuntimeUser{first.Operations[1].Upsert[1], first.Operations[1].Upsert[0]}
+	firstCanonical, err := normalizeUsersAction(first)
+	if err != nil {
+		t.Fatal(err)
 	}
-	policyDigest := digestPolicies([]trafficontrol.PrincipalPolicy{{
-		Principal:      "u1:*",
-		MaxConnections: 2,
-		UpBPS:          125000,
-		DownBPS:        250000,
-	}})
-	if policyDigest != "a26b9c164e60009f4da9782550771f098f76e2fa391520c18cb4aa1556bbc2ed" {
-		t.Fatalf("unexpected policy digest fixture: %s", policyDigest)
+	secondCanonical, err := normalizeUsersAction(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstDigest := digestJSON(firstCanonical)
+	secondDigest := digestJSON(secondCanonical)
+	if firstDigest != secondDigest {
+		t.Fatalf("canonical digest depends on operation/user order: first=%s second=%s", firstDigest, secondDigest)
+	}
+	const expectedUsersDigest = "302fa86563ab4b2a241d7ed8a6f408df0e2df88f58d9bb4ba769861385d9553a"
+	const expectedUsersCanonicalJSON = `{"schema_version":"runtime-control/v3","expected_runtime_instance_id":"instance-1","revision":7,"mode":"authoritative_replace","scope":"all_runtime_inbounds","operations":[{"inbound":"vless-in","upsert":[{"principal":"u1:d1","uuid":"11111111-1111-1111-1111-111111111111","flow":"xtls-rprx-vision"},{"principal":"u2:d1","uuid":"22222222-2222-2222-2222-222222222222"}],"delete":[]},{"inbound":"vmess-in","upsert":[],"delete":[]}]}`
+	if canonicalJSON := string(marshalRuntimeJSON(firstCanonical)); canonicalJSON != expectedUsersCanonicalJSON {
+		t.Fatalf("unexpected users canonical JSON: got=%s want=%s", canonicalJSON, expectedUsersCanonicalJSON)
+	}
+	if firstDigest != expectedUsersDigest {
+		t.Fatalf("unexpected users wire fixture digest: got=%s want=%s", firstDigest, expectedUsersDigest)
+	}
+	policyCanonical, err := normalizePolicyAction(applyPolicyRequest{
+		runtimeEnvelope: runtimeEnvelope{SchemaVersion: runtimeSchemaVersion, ExpectedRuntimeInstanceID: "instance-1", Revision: 7},
+		Mode:            "authoritative_replace",
+		Policies: []trafficontrol.PrincipalPolicy{
+			{Principal: "u2:*", UpBPS: 2_000_000},
+			{Principal: "u1:d1", MaxConnections: 2, DownBPS: 1_000_000},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const expectedPolicyDigest = "02716874df2c98fa89802165716622dda73437614093472279cb3111b0cacf82"
+	const expectedPolicyCanonicalJSON = `{"schema_version":"runtime-control/v3","expected_runtime_instance_id":"instance-1","revision":7,"mode":"authoritative_replace","policies":[{"principal":"u1:d1","max_connections":2,"up_bps":0,"down_bps":1000000},{"principal":"u2:*","max_connections":0,"up_bps":2000000,"down_bps":0}]}`
+	if canonicalJSON := string(marshalRuntimeJSON(policyCanonical)); canonicalJSON != expectedPolicyCanonicalJSON {
+		t.Fatalf("unexpected policy canonical JSON: got=%s want=%s", canonicalJSON, expectedPolicyCanonicalJSON)
+	}
+	if policyDigest := digestJSON(policyCanonical); policyDigest != expectedPolicyDigest {
+		t.Fatalf("unexpected policy wire fixture digest: got=%s want=%s", policyDigest, expectedPolicyDigest)
+	}
+	disconnectCanonical, err := normalizeDisconnectAction(disconnectPrincipalRequest{
+		runtimeEnvelope: runtimeEnvelope{SchemaVersion: runtimeSchemaVersion, ExpectedRuntimeInstanceID: "instance-1", Revision: 7},
+		Fence:           runtimeFence{UsersRevision: 7, PolicyRevision: 7},
+		Selectors:       &runtimeSelectors{Principals: []string{"u2:d1", "u1:d1"}, UserIDs: []string{"u3"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const expectedDisconnectDigest = "43f50d4edbb04014e18101d235c557cd0c400950b0df64cbad36cf807714cde4"
+	const expectedDisconnectCanonicalJSON = `{"schema_version":"runtime-control/v3","expected_runtime_instance_id":"instance-1","revision":7,"fence":{"users_revision":7,"policy_revision":7},"selectors":{"principals":["u1:d1","u2:d1"],"user_ids":["u3"]}}`
+	if canonicalJSON := string(marshalRuntimeJSON(disconnectCanonical)); canonicalJSON != expectedDisconnectCanonicalJSON {
+		t.Fatalf("unexpected disconnect canonical JSON: got=%s want=%s", canonicalJSON, expectedDisconnectCanonicalJSON)
+	}
+	if disconnectDigest := digestJSON(disconnectCanonical); disconnectDigest != expectedDisconnectDigest {
+		t.Fatalf("unexpected disconnect wire fixture digest: got=%s want=%s", disconnectDigest, expectedDisconnectDigest)
+	}
+	if digestPolicies(nil) != "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945" {
+		t.Fatalf("empty policy digest must be SHA-256 of []")
 	}
 }
 
 func TestRuntimeStatsSnapshotUsesPrincipalCumulativeTotals(t *testing.T) {
 	t.Parallel()
 
-	trafficManager, server := newRuntimeTestServer(newFakeInboundManager())
-	defer server.Close()
-
+	harness := newRuntimeTestServer(t, newFakeInboundManager())
+	defer harness.Close()
 	tracker := newFakeTracker("u1:d1")
 	tracker.metadata.Upload.Store(1)
 	tracker.metadata.Download.Store(2)
-	trafficManager.Join(tracker)
-	trafficManager.PushUploaded(100)
-	trafficManager.PushDownloaded(50)
-	trafficManager.PushPrincipalUploaded("u1:d1", 100)
-	trafficManager.PushPrincipalDownloaded("u1:d1", 50)
+	harness.traffic.Join(tracker)
+	harness.traffic.PushUploaded(100)
+	harness.traffic.PushDownloaded(50)
+	harness.traffic.PushPrincipalUploaded("u1:d1", 100)
+	harness.traffic.PushPrincipalDownloaded("u1:d1", 50)
 
-	resp, err := http.Get(server.URL + "/stats/snapshot")
+	body := runtimeJSONRequest(t, http.MethodGet, harness.server.URL+"/stats/snapshot", "", http.StatusOK)
+	var response struct {
+		UploadTotal    int64                             `json:"upload_total"`
+		DownloadTotal  int64                             `json:"download_total"`
+		PrincipalStats []trafficontrol.PrincipalSnapshot `json:"principal_stats"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatalf("decode stats: %v", err)
+	}
+	if response.UploadTotal != 100 || response.DownloadTotal != 50 {
+		t.Fatalf("unexpected totals: %+v", response)
+	}
+	for _, principal := range response.PrincipalStats {
+		if principal.Principal == "u1:d1" && principal.Active == 1 && principal.Upload == 100 && principal.Download == 50 {
+			return
+		}
+	}
+	t.Fatalf("principal cumulative totals missing: %+v", response.PrincipalStats)
+}
+
+func usersRequest(t *testing.T, instance string, revision int64, requestID, mode, scope string, operations []usersOperation) applyUsersRequest {
+	t.Helper()
+	request := applyUsersRequest{
+		runtimeEnvelope: runtimeEnvelope{
+			SchemaVersion: runtimeSchemaVersion, ExpectedRuntimeInstanceID: instance, Revision: revision, RequestID: requestID,
+		},
+		Mode: mode, Scope: scope, Operations: operations,
+	}
+	canonical, err := normalizeUsersAction(request)
 	if err != nil {
-		t.Fatalf("request failed: %v", err)
+		t.Fatalf("normalize users fixture: %v", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("unexpected status: %d", resp.StatusCode)
-	}
-
-	var body struct {
-		UploadTotal    int64 `json:"upload_total"`
-		DownloadTotal  int64 `json:"download_total"`
-		PrincipalStats []struct {
-			Principal string `json:"principal"`
-			Active    int    `json:"active"`
-			Upload    int64  `json:"upload"`
-			Download  int64  `json:"download"`
-		} `json:"principal_stats"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if body.UploadTotal != 100 || body.DownloadTotal != 50 {
-		t.Fatalf("unexpected totals: %+v", body)
-	}
-
-	for _, principalStat := range body.PrincipalStats {
-		if principalStat.Principal != "u1:d1" {
-			continue
-		}
-		if principalStat.Active != 1 {
-			t.Fatalf("unexpected active count: %+v", principalStat)
-		}
-		if principalStat.Upload != 100 || principalStat.Download != 50 {
-			t.Fatalf("expected principal cumulative totals, got %+v", principalStat)
-		}
-		return
-	}
-	t.Fatal("expected u1:d1 principal stats in snapshot")
+	request.PayloadDigest = digestJSON(canonical)
+	return request
 }
 
-func applyRuntimePayload(t *testing.T, serverURL, payload string) {
+func policyRequest(t *testing.T, instance string, revision int64, requestID, mode string, policies []trafficontrol.PrincipalPolicy) applyPolicyRequest {
 	t.Helper()
-	_ = runtimeJSONRequest(t, http.MethodPut, serverURL+"/users", payload, http.StatusOK)
+	request := applyPolicyRequest{
+		runtimeEnvelope: runtimeEnvelope{
+			SchemaVersion: runtimeSchemaVersion, ExpectedRuntimeInstanceID: instance, Revision: revision, RequestID: requestID,
+		},
+		Mode: mode, Policies: policies,
+	}
+	canonical, err := normalizePolicyAction(request)
+	if err != nil {
+		t.Fatalf("normalize policy fixture: %v", err)
+	}
+	request.PayloadDigest = digestJSON(canonical)
+	return request
 }
 
-func getRuntimeStatusBody(t *testing.T, serverURL string) []byte {
+func disconnectRequest(t *testing.T, instance string, revision int64, requestID string, fence runtimeFence, selectors *runtimeSelectors, all bool) disconnectPrincipalRequest {
 	t.Helper()
-	return runtimeJSONRequest(t, http.MethodGet, serverURL+"/status", "", http.StatusOK)
+	request := disconnectPrincipalRequest{
+		runtimeEnvelope: runtimeEnvelope{
+			SchemaVersion: runtimeSchemaVersion, ExpectedRuntimeInstanceID: instance, Revision: revision, RequestID: requestID,
+		},
+		Fence: fence, Selectors: selectors, All: all,
+	}
+	canonical, err := normalizeDisconnectAction(request)
+	if err != nil {
+		t.Fatalf("normalize disconnect fixture: %v", err)
+	}
+	request.PayloadDigest = digestJSON(canonical)
+	return request
+}
+
+func fetchRuntimeStatus(t *testing.T, serverURL string) runtimeTestStatus {
+	t.Helper()
+	body := runtimeJSONRequest(t, http.MethodGet, serverURL+"/status", "", http.StatusOK)
+	var status runtimeTestStatus
+	if err := json.Unmarshal(body, &status); err != nil {
+		t.Fatalf("decode runtime status: %v body=%s", err, body)
+	}
+	return status
+}
+
+func assertRuntimeError(t *testing.T, targetURL, payload string, expectedStatus int, expectedCode string) {
+	t.Helper()
+	method := http.MethodPut
+	if strings.HasSuffix(targetURL, "/disconnect") {
+		method = http.MethodPost
+	}
+	body := runtimeJSONRequest(t, method, targetURL, payload, expectedStatus)
+	if code := codeFromBody(t, body); code != expectedCode {
+		t.Fatalf("expected runtime error %q, got %q body=%s", expectedCode, code, body)
+	}
+}
+
+func codeFromBody(t *testing.T, body []byte) string {
+	t.Helper()
+	return stringFromBody(t, body, "code")
+}
+
+func stringFromBody(t *testing.T, body []byte, key string) string {
+	t.Helper()
+	var value map[string]any
+	if err := json.Unmarshal(body, &value); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, body)
+	}
+	result, _ := value[key].(string)
+	return result
+}
+
+func boolFromBody(t *testing.T, body []byte, key string) bool {
+	t.Helper()
+	var value map[string]any
+	if err := json.Unmarshal(body, &value); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, body)
+	}
+	result, _ := value[key].(bool)
+	return result
+}
+
+func intFromBody(t *testing.T, body []byte, key string) int {
+	t.Helper()
+	var value map[string]any
+	if err := json.Unmarshal(body, &value); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, body)
+	}
+	result, _ := value[key].(float64)
+	return int(result)
+}
+
+func mustJSON(t *testing.T, value any) string {
+	t.Helper()
+	body, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal fixture: %v", err)
+	}
+	return string(body)
 }
 
 func runtimeJSONRequest(t *testing.T, method, targetURL, payload string, expectedStatus int) []byte {
@@ -636,24 +925,24 @@ func runtimeJSONRequest(t *testing.T, method, targetURL, payload string, expecte
 	if payload != "" {
 		body = bytes.NewBufferString(payload)
 	}
-	req, err := http.NewRequest(method, targetURL, body)
+	request, err := http.NewRequest(method, targetURL, body)
 	if err != nil {
 		t.Fatalf("create %s request: %v", method, err)
 	}
 	if payload != "" {
-		req.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := http.DefaultClient.Do(req)
+	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatalf("request %s %s failed: %v", method, targetURL, err)
 	}
-	defer resp.Body.Close()
-	responseBody, err := io.ReadAll(resp.Body)
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(response.Body)
 	if err != nil {
 		t.Fatalf("read %s response: %v", method, err)
 	}
-	if resp.StatusCode != expectedStatus {
-		t.Fatalf("expected status %d, got %d body=%s", expectedStatus, resp.StatusCode, responseBody)
+	if response.StatusCode != expectedStatus {
+		t.Fatalf("expected status %d, got %d body=%s", expectedStatus, response.StatusCode, responseBody)
 	}
 	return responseBody
 }
@@ -668,7 +957,8 @@ func containsString(values []string, expected string) bool {
 }
 
 var (
-	_ adapter.RuntimeUserInbound = (*fakeRuntimeInbound)(nil)
-	_ adapter.InboundManager     = (*fakeInboundManager)(nil)
-	_ trafficontrol.Tracker      = (*fakeTracker)(nil)
+	_ adapter.AtomicRuntimeUserInbound = (*fakeRuntimeInbound)(nil)
+	_ adapter.RuntimeUserInbound       = (*nonAtomicRuntimeInbound)(nil)
+	_ adapter.InboundManager           = (*fakeInboundManager)(nil)
+	_ trafficontrol.Tracker            = (*fakeTracker)(nil)
 )

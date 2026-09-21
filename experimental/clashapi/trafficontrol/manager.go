@@ -281,6 +281,10 @@ func (m *Manager) ApplyPolicyRevision(revision int64, replace bool, policies []P
 		if policy.DownBPS < 0 {
 			policy.DownBPS = 0
 		}
+		if !replace && policy.MaxConnections == 0 && policy.UpBPS == 0 && policy.DownBPS == 0 {
+			delete(m.policies, principal)
+			continue
+		}
 		m.policies[principal] = policy
 	}
 	if revision > 0 {
@@ -295,6 +299,22 @@ func (m *Manager) DisconnectPrincipal(principal string) int {
 
 func (m *Manager) DisconnectUser(userID string) int {
 	return m.DisconnectSelectors(nil, []string{userID})
+}
+
+// DisconnectAll closes a point-in-time snapshot of every active connection.
+// runtime-control/v3 uses this for drain and recovery so connections unknown to
+// the database cannot survive an authoritative empty users snapshot.
+func (m *Manager) DisconnectAll() int {
+	if m.disconnectScanHook != nil {
+		m.disconnectScanHook()
+	}
+	var selected []Tracker
+	m.connections.Range(func(_ uuid.UUID, value Tracker) bool {
+		selected = append(selected, value)
+		return true
+	})
+	closeTrackers(selected)
+	return len(selected)
 }
 
 // DisconnectSelectors closes every connection matched by an exact principal

@@ -43,6 +43,8 @@ type Inbound struct {
 	userAccess   sync.RWMutex
 }
 
+var _ adapter.AtomicRuntimeUserInbound = (*Inbound)(nil)
+
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TUICInboundOptions) (adapter.Inbound, error) {
 	options.UDPFragmentDefault = true
 	if options.TLS == nil || !options.TLS.Enabled {
@@ -301,4 +303,98 @@ func (h *Inbound) replaceUsersLocked(users []option.TUICUser) error {
 	h.userNameList = userNameList
 	h.userIDList = userIDList
 	return nil
+}
+
+type runtimeUserReplaceTransaction struct {
+	inbound      *Inbound
+	users        []option.TUICUser
+	userList     []int
+	userNameList []string
+	userIDList   []string
+	userUUIDList [][16]byte
+	passwordList []string
+	result       adapter.RuntimeUserReplaceResult
+}
+
+func (h *Inbound) PrepareRuntimeUserReplace(users []adapter.RuntimeUser) (adapter.RuntimeUserReplaceTransaction, error) {
+	h.userAccess.Lock()
+	nextUsers := make([]option.TUICUser, 0, len(users))
+	userList := make([]int, 0, len(users))
+	userNameList := make([]string, 0, len(users))
+	userIDList := make([]string, 0, len(users))
+	userUUIDList := make([][16]byte, 0, len(users))
+	passwordList := make([]string, 0, len(users))
+	principals := make(map[string]struct{}, len(users))
+	credentials := make(map[[16]byte]string, len(users))
+	for index, runtimeUser := range users {
+		principal := strings.TrimSpace(runtimeUser.Principal)
+		if principal == "" {
+			h.userAccess.Unlock()
+			return nil, E.New("missing principal for runtime user ", index)
+		}
+		if _, loaded := principals[principal]; loaded {
+			h.userAccess.Unlock()
+			return nil, E.New("duplicate runtime user principal: ", principal)
+		}
+		credential, err := uuid.FromString(strings.TrimSpace(runtimeUser.UUID))
+		if err != nil {
+			h.userAccess.Unlock()
+			return nil, E.Cause(err, "invalid uuid for runtime user ", principal)
+		}
+		if oldPrincipal, loaded := credentials[credential]; loaded {
+			h.userAccess.Unlock()
+			return nil, E.New("runtime user uuid is shared by ", oldPrincipal, " and ", principal)
+		}
+		principals[principal] = struct{}{}
+		credentials[credential] = principal
+		userList = append(userList, index)
+		userNameList = append(userNameList, principal)
+		userIDList = append(userIDList, strings.TrimSpace(runtimeUser.UUID))
+		userUUIDList = append(userUUIDList, credential)
+		passwordList = append(passwordList, runtimeUser.Password)
+		nextUsers = append(nextUsers, option.TUICUser{
+			Name:     principal,
+			UUID:     strings.TrimSpace(runtimeUser.UUID),
+			Password: runtimeUser.Password,
+		})
+	}
+	return &runtimeUserReplaceTransaction{
+		inbound:      h,
+		users:        nextUsers,
+		userList:     userList,
+		userNameList: userNameList,
+		userIDList:   userIDList,
+		userUUIDList: userUUIDList,
+		passwordList: passwordList,
+		result: adapter.RuntimeUserReplaceResult{
+			Upserted: len(nextUsers),
+			Deleted:  runtimeDeletedUserCount(h.users, principals),
+		},
+	}, nil
+}
+
+func (t *runtimeUserReplaceTransaction) Apply() adapter.RuntimeUserReplaceResult {
+	t.inbound.server.UpdateUsers(t.userList, t.userUUIDList, t.passwordList)
+	t.inbound.users = t.users
+	t.inbound.userNameList = t.userNameList
+	t.inbound.userIDList = t.userIDList
+	return t.result
+}
+
+func (t *runtimeUserReplaceTransaction) Release() {
+	t.inbound.userAccess.Unlock()
+}
+
+func (t *runtimeUserReplaceTransaction) Abort() {
+	t.inbound.userAccess.Unlock()
+}
+
+func runtimeDeletedUserCount(current []option.TUICUser, desired map[string]struct{}) int {
+	deleted := 0
+	for _, user := range current {
+		if _, loaded := desired[strings.TrimSpace(user.Name)]; !loaded {
+			deleted++
+		}
+	}
+	return deleted
 }

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/gofrs/uuid/v5"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/listener"
@@ -35,41 +36,37 @@ func RegisterInbound(registry *inbound.Registry) {
 }
 
 var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
+var _ adapter.AtomicRuntimeUserInbound = (*Inbound)(nil)
 
 type Inbound struct {
 	inbound.Adapter
-	ctx        context.Context
-	router     adapter.ConnectionRouterEx
-	logger     logger.ContextLogger
-	listener   *listener.Listener
-	service    *vmess.Service[int]
-	users      []option.VMessUser
-	tlsConfig  tls.ServerConfig
-	transport  adapter.V2RayServerTransport
-	userAccess sync.RWMutex
+	ctx                     context.Context
+	router                  adapter.ConnectionRouterEx
+	logger                  logger.ContextLogger
+	listener                *listener.Listener
+	service                 *vmess.Service[int]
+	users                   []option.VMessUser
+	tlsConfig               tls.ServerConfig
+	transport               adapter.V2RayServerTransport
+	userAccess              sync.RWMutex
+	disableHeaderProtection bool
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.VMessInboundOptions) (adapter.Inbound, error) {
 	inbound := &Inbound{
-		Adapter: inbound.NewAdapter(C.TypeVMess, tag),
-		ctx:     ctx,
-		router:  uot.NewRouter(router, logger),
-		logger:  logger,
-		users:   options.Users,
+		Adapter:                 inbound.NewAdapter(C.TypeVMess, tag),
+		ctx:                     ctx,
+		router:                  uot.NewRouter(router, logger),
+		logger:                  logger,
+		users:                   options.Users,
+		disableHeaderProtection: options.Transport != nil && options.Transport.Type != "",
 	}
 	var err error
 	inbound.router, err = mux.NewRouterWithOptions(inbound.router, logger, common.PtrValueOrDefault(options.Multiplex))
 	if err != nil {
 		return nil, err
 	}
-	var serviceOptions []vmess.ServiceOption
-	if timeFunc := ntp.TimeFuncFromContext(ctx); timeFunc != nil {
-		serviceOptions = append(serviceOptions, vmess.ServiceWithTimeFunc(timeFunc))
-	}
-	if options.Transport != nil && options.Transport.Type != "" {
-		serviceOptions = append(serviceOptions, vmess.ServiceWithDisableHeaderProtection())
-	}
-	service := vmess.NewService[int](adapter.NewUpstreamContextHandlerEx(inbound.newConnectionEx, inbound.newPacketConnectionEx), serviceOptions...)
+	service := inbound.newService()
 	inbound.service = service
 	err = service.UpdateUsers(common.MapIndexed(options.Users, func(index int, it option.VMessUser) int {
 		return index
@@ -101,6 +98,17 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		ConnectionHandler: inbound,
 	})
 	return inbound, nil
+}
+
+func (h *Inbound) newService() *vmess.Service[int] {
+	var serviceOptions []vmess.ServiceOption
+	if timeFunc := ntp.TimeFuncFromContext(h.ctx); timeFunc != nil {
+		serviceOptions = append(serviceOptions, vmess.ServiceWithTimeFunc(timeFunc))
+	}
+	if h.disableHeaderProtection {
+		serviceOptions = append(serviceOptions, vmess.ServiceWithDisableHeaderProtection())
+	}
+	return vmess.NewService[int](adapter.NewUpstreamContextHandlerEx(h.newConnectionEx, h.newPacketConnectionEx), serviceOptions...)
 }
 
 func (h *Inbound) Start(stage adapter.StartStage) error {
@@ -166,7 +174,10 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata a
 		}
 		conn = tlsConn
 	}
-	err := h.service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
+	h.userAccess.RLock()
+	service := h.service
+	h.userAccess.RUnlock()
+	err := service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
 	if err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
@@ -324,6 +335,110 @@ func (h *Inbound) DeleteRuntimeUsers(principals []string) (int, error) {
 	}
 	h.users = filtered
 	return deleted, nil
+}
+
+type runtimeUserReplaceTransaction struct {
+	inbound         *Inbound
+	users           []option.VMessUser
+	preparedService *vmess.Service[int]
+	previousService *vmess.Service[int]
+	result          adapter.RuntimeUserReplaceResult
+}
+
+func (h *Inbound) PrepareRuntimeUserReplace(users []adapter.RuntimeUser) (adapter.RuntimeUserReplaceTransaction, error) {
+	h.userAccess.Lock()
+	nextUsers := make([]option.VMessUser, 0, len(users))
+	principals := make(map[string]struct{}, len(users))
+	credentials := make(map[string]string, len(users))
+	for index, runtimeUser := range users {
+		principal := strings.TrimSpace(runtimeUser.Principal)
+		if principal == "" {
+			h.userAccess.Unlock()
+			return nil, E.New("missing principal for runtime user ", index)
+		}
+		if _, loaded := principals[principal]; loaded {
+			h.userAccess.Unlock()
+			return nil, E.New("duplicate runtime user principal: ", principal)
+		}
+		credential := strings.TrimSpace(runtimeUser.UUID)
+		if credential == "" {
+			h.userAccess.Unlock()
+			return nil, E.New("missing uuid for runtime user ", principal)
+		}
+		if _, err := uuid.FromString(credential); err != nil {
+			h.userAccess.Unlock()
+			return nil, E.Cause(err, "invalid uuid for runtime user ", principal)
+		}
+		if oldPrincipal, loaded := credentials[credential]; loaded {
+			h.userAccess.Unlock()
+			return nil, E.New("runtime user uuid is shared by ", oldPrincipal, " and ", principal)
+		}
+		if runtimeUser.AlterID < 0 {
+			h.userAccess.Unlock()
+			return nil, E.New("negative alter id for runtime user ", principal)
+		}
+		principals[principal] = struct{}{}
+		credentials[credential] = principal
+		nextUsers = append(nextUsers, option.VMessUser{
+			Name:    principal,
+			UUID:    credential,
+			AlterId: runtimeUser.AlterID,
+		})
+	}
+	preparedService := h.newService()
+	err := preparedService.UpdateUsers(common.MapIndexed(nextUsers, func(index int, _ option.VMessUser) int {
+		return index
+	}), common.Map(nextUsers, func(it option.VMessUser) string {
+		return it.UUID
+	}), common.Map(nextUsers, func(it option.VMessUser) int {
+		return it.AlterId
+	}))
+	if err != nil {
+		h.userAccess.Unlock()
+		return nil, err
+	}
+	if err = preparedService.Start(); err != nil {
+		h.userAccess.Unlock()
+		return nil, err
+	}
+	return &runtimeUserReplaceTransaction{
+		inbound:         h,
+		users:           nextUsers,
+		preparedService: preparedService,
+		result: adapter.RuntimeUserReplaceResult{
+			Upserted: len(nextUsers),
+			Deleted:  runtimeDeletedUserCount(h.users, principals),
+		},
+	}, nil
+}
+
+func (t *runtimeUserReplaceTransaction) Apply() adapter.RuntimeUserReplaceResult {
+	t.previousService = t.inbound.service
+	t.inbound.service = t.preparedService
+	t.inbound.users = t.users
+	return t.result
+}
+
+func (t *runtimeUserReplaceTransaction) Release() {
+	t.inbound.userAccess.Unlock()
+	if t.previousService != nil {
+		_ = t.previousService.Close()
+	}
+}
+
+func (t *runtimeUserReplaceTransaction) Abort() {
+	_ = t.preparedService.Close()
+	t.inbound.userAccess.Unlock()
+}
+
+func runtimeDeletedUserCount(current []option.VMessUser, desired map[string]struct{}) int {
+	deleted := 0
+	for _, user := range current {
+		if _, loaded := desired[strings.TrimSpace(user.Name)]; !loaded {
+			deleted++
+		}
+	}
+	return deleted
 }
 
 var _ adapter.V2RayServerTransportHandler = (*inboundTransportHandler)(nil)

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/gofrs/uuid/v5"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/listener"
@@ -34,6 +35,7 @@ func RegisterInbound(registry *inbound.Registry) {
 }
 
 var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
+var _ adapter.AtomicRuntimeUserInbound = (*Inbound)(nil)
 
 type Inbound struct {
 	inbound.Adapter
@@ -312,6 +314,88 @@ func (h *Inbound) DeleteRuntimeUsers(principals []string) (int, error) {
 	}))
 	h.users = filtered
 	return deleted, nil
+}
+
+type runtimeUserReplaceTransaction struct {
+	inbound *Inbound
+	users   []option.VLESSUser
+	result  adapter.RuntimeUserReplaceResult
+}
+
+func (h *Inbound) PrepareRuntimeUserReplace(users []adapter.RuntimeUser) (adapter.RuntimeUserReplaceTransaction, error) {
+	h.userAccess.Lock()
+	nextUsers := make([]option.VLESSUser, 0, len(users))
+	principals := make(map[string]struct{}, len(users))
+	credentials := make(map[string]string, len(users))
+	for index, runtimeUser := range users {
+		principal := strings.TrimSpace(runtimeUser.Principal)
+		if principal == "" {
+			h.userAccess.Unlock()
+			return nil, E.New("missing principal for runtime user ", index)
+		}
+		if _, loaded := principals[principal]; loaded {
+			h.userAccess.Unlock()
+			return nil, E.New("duplicate runtime user principal: ", principal)
+		}
+		credential := strings.TrimSpace(runtimeUser.UUID)
+		if credential == "" {
+			h.userAccess.Unlock()
+			return nil, E.New("missing uuid for runtime user ", principal)
+		}
+		if _, err := uuid.FromString(credential); err != nil {
+			h.userAccess.Unlock()
+			return nil, E.Cause(err, "invalid uuid for runtime user ", principal)
+		}
+		if oldPrincipal, loaded := credentials[credential]; loaded {
+			h.userAccess.Unlock()
+			return nil, E.New("runtime user uuid is shared by ", oldPrincipal, " and ", principal)
+		}
+		principals[principal] = struct{}{}
+		credentials[credential] = principal
+		nextUsers = append(nextUsers, option.VLESSUser{
+			Name: principal,
+			UUID: credential,
+			Flow: strings.TrimSpace(runtimeUser.Flow),
+		})
+	}
+	return &runtimeUserReplaceTransaction{
+		inbound: h,
+		users:   nextUsers,
+		result: adapter.RuntimeUserReplaceResult{
+			Upserted: len(nextUsers),
+			Deleted:  runtimeDeletedUserCount(h.users, principals),
+		},
+	}, nil
+}
+
+func (t *runtimeUserReplaceTransaction) Apply() adapter.RuntimeUserReplaceResult {
+	t.inbound.service.UpdateUsers(common.MapIndexed(t.users, func(index int, _ option.VLESSUser) int {
+		return index
+	}), common.Map(t.users, func(it option.VLESSUser) string {
+		return it.UUID
+	}), common.Map(t.users, func(it option.VLESSUser) string {
+		return it.Flow
+	}))
+	t.inbound.users = t.users
+	return t.result
+}
+
+func (t *runtimeUserReplaceTransaction) Release() {
+	t.inbound.userAccess.Unlock()
+}
+
+func (t *runtimeUserReplaceTransaction) Abort() {
+	t.inbound.userAccess.Unlock()
+}
+
+func runtimeDeletedUserCount(current []option.VLESSUser, desired map[string]struct{}) int {
+	deleted := 0
+	for _, user := range current {
+		if _, loaded := desired[strings.TrimSpace(user.Name)]; !loaded {
+			deleted++
+		}
+	}
+	return deleted
 }
 
 var _ adapter.V2RayServerTransportHandler = (*inboundTransportHandler)(nil)

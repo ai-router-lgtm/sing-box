@@ -121,6 +121,22 @@ func TestApplyPolicyRevisionRejectStale(t *testing.T) {
 	}
 }
 
+func TestApplyPolicyRevisionDeltaDeletesAllZeroPolicy(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager()
+	if !manager.ApplyPolicyRevision(1, false, []PrincipalPolicy{{Principal: "user-1", UpBPS: 1024}}) {
+		t.Fatal("initial policy delta was not applied")
+	}
+	if !manager.ApplyPolicyRevision(2, false, []PrincipalPolicy{{Principal: "user-1"}}) {
+		t.Fatal("zero policy delta was not applied")
+	}
+	snapshot := manager.PolicySnapshot()
+	if len(snapshot) != 0 {
+		t.Fatalf("zero policy delta must delete the principal, got=%+v", snapshot)
+	}
+}
+
 func TestJoinRejectWhenMaxConnectionsReached(t *testing.T) {
 	t.Parallel()
 
@@ -207,6 +223,34 @@ func TestDisconnectSelectorsScansConnectionsOnce(t *testing.T) {
 	}
 	if trackers[3].closed.Load() {
 		t.Fatal("unexpected close for unmatched tracker")
+	}
+}
+
+func TestDisconnectAllScansAndClosesEveryConnection(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager()
+	var scans atomic.Int64
+	manager.disconnectScanHook = func() { scans.Add(1) }
+	trackers := []*fakeTracker{
+		newFakeTracker("user-1"),
+		newFakeTracker("user-2:device-a"),
+		newFakeTracker("untracked-static-principal"),
+	}
+	for _, tracker := range trackers {
+		manager.Join(tracker)
+	}
+
+	if disconnected := manager.DisconnectAll(); disconnected != len(trackers) {
+		t.Fatalf("expected %d disconnected, got %d", len(trackers), disconnected)
+	}
+	if scans.Load() != 1 {
+		t.Fatalf("expected one all-connections scan, got %d", scans.Load())
+	}
+	for index, tracker := range trackers {
+		if !tracker.closed.Load() {
+			t.Fatalf("tracker %d was not closed", index)
+		}
 	}
 }
 

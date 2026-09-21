@@ -43,6 +43,8 @@ type Inbound struct {
 	userAccess   sync.RWMutex
 }
 
+var _ adapter.AtomicRuntimeUserInbound = (*Inbound)(nil)
+
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.Hysteria2InboundOptions) (adapter.Inbound, error) {
 	options.UDPFragmentDefault = true
 	if options.TLS == nil || !options.TLS.Enabled {
@@ -317,4 +319,66 @@ func (h *Inbound) replaceUsersLocked(users []option.Hysteria2User) {
 	h.service.UpdateUsers(userList, userPasswordList)
 	h.users = users
 	h.userNameList = userNameList
+}
+
+type runtimeUserReplaceTransaction struct {
+	inbound *Inbound
+	users   []option.Hysteria2User
+	result  adapter.RuntimeUserReplaceResult
+}
+
+func (h *Inbound) PrepareRuntimeUserReplace(users []adapter.RuntimeUser) (adapter.RuntimeUserReplaceTransaction, error) {
+	h.userAccess.Lock()
+	nextUsers := make([]option.Hysteria2User, 0, len(users))
+	principals := make(map[string]struct{}, len(users))
+	passwords := make(map[string]string, len(users))
+	for index, runtimeUser := range users {
+		principal := strings.TrimSpace(runtimeUser.Principal)
+		if principal == "" {
+			h.userAccess.Unlock()
+			return nil, E.New("missing principal for runtime user ", index)
+		}
+		if _, loaded := principals[principal]; loaded {
+			h.userAccess.Unlock()
+			return nil, E.New("duplicate runtime user principal: ", principal)
+		}
+		if oldPrincipal, loaded := passwords[runtimeUser.Password]; loaded {
+			h.userAccess.Unlock()
+			return nil, E.New("runtime user password is shared by ", oldPrincipal, " and ", principal)
+		}
+		principals[principal] = struct{}{}
+		passwords[runtimeUser.Password] = principal
+		nextUsers = append(nextUsers, option.Hysteria2User{Name: principal, Password: runtimeUser.Password})
+	}
+	return &runtimeUserReplaceTransaction{
+		inbound: h,
+		users:   nextUsers,
+		result: adapter.RuntimeUserReplaceResult{
+			Upserted: len(nextUsers),
+			Deleted:  runtimeDeletedUserCount(h.users, principals),
+		},
+	}, nil
+}
+
+func (t *runtimeUserReplaceTransaction) Apply() adapter.RuntimeUserReplaceResult {
+	t.inbound.replaceUsersLocked(t.users)
+	return t.result
+}
+
+func (t *runtimeUserReplaceTransaction) Release() {
+	t.inbound.userAccess.Unlock()
+}
+
+func (t *runtimeUserReplaceTransaction) Abort() {
+	t.inbound.userAccess.Unlock()
+}
+
+func runtimeDeletedUserCount(current []option.Hysteria2User, desired map[string]struct{}) int {
+	deleted := 0
+	for _, user := range current {
+		if _, loaded := desired[strings.TrimSpace(user.Name)]; !loaded {
+			deleted++
+		}
+	}
+	return deleted
 }

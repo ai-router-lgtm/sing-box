@@ -35,6 +35,31 @@ type RuntimeUserInbound interface {
 	DeleteRuntimeUsers(principals []string) (int, error)
 }
 
+// RuntimeUserReplaceTransaction is prepared while the inbound's user state is
+// exclusively locked. Preparing every affected inbound before applying makes
+// a multi-inbound authoritative replacement validation-complete before any
+// live credential set changes. Apply must not fail and keeps the lock held;
+// Release unlocks only after every prepared inbound has applied. Abort leaves
+// the inbound unchanged and releases the lock.
+type RuntimeUserReplaceTransaction interface {
+	Apply() RuntimeUserReplaceResult
+	Release()
+	Abort()
+}
+
+type RuntimeUserReplaceResult struct {
+	Upserted int
+	Deleted  int
+}
+
+// AtomicRuntimeUserInbound is required by every runtime-control/v3 users
+// mutation. Delta actions are converted to a complete per-inbound snapshot so
+// they share the same prepare/apply/release safety boundary.
+type AtomicRuntimeUserInbound interface {
+	RuntimeUserInbound
+	PrepareRuntimeUserReplace(users []RuntimeUser) (RuntimeUserReplaceTransaction, error)
+}
+
 type TCPInjectableInbound interface {
 	Inbound
 	ConnectionHandlerEx

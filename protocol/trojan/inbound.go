@@ -30,6 +30,7 @@ func RegisterInbound(registry *inbound.Registry) {
 }
 
 var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
+var _ adapter.AtomicRuntimeUserInbound = (*Inbound)(nil)
 
 type Inbound struct {
 	inbound.Adapter
@@ -41,6 +42,7 @@ type Inbound struct {
 	tlsConfig                tls.ServerConfig
 	fallbackAddr             M.Socksaddr
 	fallbackAddrTLSNextProto map[string]M.Socksaddr
+	fallbackHandler          N.TCPConnectionHandlerEx
 	transport                adapter.V2RayServerTransport
 	userAccess               sync.RWMutex
 }
@@ -89,7 +91,8 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		}
 		fallbackHandler = adapter.NewUpstreamContextHandlerEx(inbound.fallbackConnection, nil)
 	}
-	service := trojan.NewService[int](adapter.NewUpstreamContextHandlerEx(inbound.newConnection, inbound.newPacketConnection), fallbackHandler, logger)
+	inbound.fallbackHandler = fallbackHandler
+	service := inbound.newService()
 	err := service.UpdateUsers(common.MapIndexed(options.Users, func(index int, it option.TrojanUser) int {
 		return index
 	}), common.Map(options.Users, func(it option.TrojanUser) string {
@@ -117,6 +120,14 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		ConnectionHandler: inbound,
 	})
 	return inbound, nil
+}
+
+func (h *Inbound) newService() *trojan.Service[int] {
+	return trojan.NewService[int](
+		adapter.NewUpstreamContextHandlerEx(h.newConnection, h.newPacketConnection),
+		h.fallbackHandler,
+		h.logger,
+	)
 }
 
 func (h *Inbound) Start(stage adapter.StartStage) error {
@@ -177,7 +188,10 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata a
 		}
 		conn = tlsConn
 	}
-	err := h.service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
+	h.userAccess.RLock()
+	service := h.service
+	h.userAccess.RUnlock()
+	err := service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
 	if err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
@@ -319,6 +333,80 @@ func (h *Inbound) DeleteRuntimeUsers(principals []string) (int, error) {
 	}
 	h.users = filtered
 	return deleted, nil
+}
+
+type runtimeUserReplaceTransaction struct {
+	inbound         *Inbound
+	users           []option.TrojanUser
+	preparedService *trojan.Service[int]
+	result          adapter.RuntimeUserReplaceResult
+}
+
+func (h *Inbound) PrepareRuntimeUserReplace(users []adapter.RuntimeUser) (adapter.RuntimeUserReplaceTransaction, error) {
+	h.userAccess.Lock()
+	nextUsers := make([]option.TrojanUser, 0, len(users))
+	principals := make(map[string]struct{}, len(users))
+	passwords := make(map[string]string, len(users))
+	for index, runtimeUser := range users {
+		principal := strings.TrimSpace(runtimeUser.Principal)
+		if principal == "" {
+			h.userAccess.Unlock()
+			return nil, E.New("missing principal for runtime user ", index)
+		}
+		if _, loaded := principals[principal]; loaded {
+			h.userAccess.Unlock()
+			return nil, E.New("duplicate runtime user principal: ", principal)
+		}
+		if oldPrincipal, loaded := passwords[runtimeUser.Password]; loaded {
+			h.userAccess.Unlock()
+			return nil, E.New("runtime user password is shared by ", oldPrincipal, " and ", principal)
+		}
+		principals[principal] = struct{}{}
+		passwords[runtimeUser.Password] = principal
+		nextUsers = append(nextUsers, option.TrojanUser{Name: principal, Password: runtimeUser.Password})
+	}
+	preparedService := h.newService()
+	if err := preparedService.UpdateUsers(common.MapIndexed(nextUsers, func(index int, _ option.TrojanUser) int {
+		return index
+	}), common.Map(nextUsers, func(it option.TrojanUser) string {
+		return it.Password
+	})); err != nil {
+		h.userAccess.Unlock()
+		return nil, err
+	}
+	return &runtimeUserReplaceTransaction{
+		inbound:         h,
+		users:           nextUsers,
+		preparedService: preparedService,
+		result: adapter.RuntimeUserReplaceResult{
+			Upserted: len(nextUsers),
+			Deleted:  runtimeDeletedUserCount(h.users, principals),
+		},
+	}, nil
+}
+
+func (t *runtimeUserReplaceTransaction) Apply() adapter.RuntimeUserReplaceResult {
+	t.inbound.service = t.preparedService
+	t.inbound.users = t.users
+	return t.result
+}
+
+func (t *runtimeUserReplaceTransaction) Release() {
+	t.inbound.userAccess.Unlock()
+}
+
+func (t *runtimeUserReplaceTransaction) Abort() {
+	t.inbound.userAccess.Unlock()
+}
+
+func runtimeDeletedUserCount(current []option.TrojanUser, desired map[string]struct{}) int {
+	deleted := 0
+	for _, user := range current {
+		if _, loaded := desired[strings.TrimSpace(user.Name)]; !loaded {
+			deleted++
+		}
+	}
+	return deleted
 }
 
 func (h *Inbound) fallbackConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
