@@ -205,6 +205,16 @@ Clash 中的默认模式，默认使用 `Rule`。
 }
 ```
 
+当 `replace=false` 时，`max_connections`、`up_bps`、`down_bps` 全为 0 的条目表示删除该 principal 的限制。删除不存在的条目也不会留下空策略；其他 principal 不受影响。过旧版本仍被拒绝。`replace=true` 的完整替换行为保持兼容，不应用此增量删除规则。
+
+清除限制示例：
+
+```json
+{"revision":1002,"request_id":"policy-clear-001","replace":false,"policies":[{"principal":"user_id:device_id","max_connections":0,"up_bps":0,"down_bps":0}]}
+```
+
+成功清除后，该条目不再参与 `/runtime/status` 和 `/runtime/policy/snapshot` 的策略数量及摘要。
+
 响应字段：
 
 - `applied`：该版本是否被接受。

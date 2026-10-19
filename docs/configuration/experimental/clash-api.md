@@ -207,6 +207,16 @@ Request body:
 }
 ```
 
+With `replace=false`, an entry whose `max_connections`, `up_bps`, and `down_bps` are all zero deletes that principal's limits. Clearing an absent entry does not retain an empty policy or affect other principals. Stale revisions remain rejected. Full replacement with `replace=true` retains its existing behavior and does not use this delta deletion rule.
+
+Clear limits example:
+
+```json
+{"revision":1002,"request_id":"policy-clear-001","replace":false,"policies":[{"principal":"user_id:device_id","max_connections":0,"up_bps":0,"down_bps":0}]}
+```
+
+After a successful clear, the entry no longer contributes to the policy count or digest in `/runtime/status` and `/runtime/policy/snapshot`.
+
 Response fields:
 
 - `applied`: whether this revision is accepted.

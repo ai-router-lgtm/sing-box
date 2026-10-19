@@ -281,6 +281,11 @@ func (m *Manager) ApplyPolicyRevision(revision int64, replace bool, policies []P
 		if policy.DownBPS < 0 {
 			policy.DownBPS = 0
 		}
+		// An all-zero delta clears limits instead of retaining an empty policy.
+		if !replace && policy.MaxConnections == 0 && policy.UpBPS == 0 && policy.DownBPS == 0 {
+			delete(m.policies, principal)
+			continue
+		}
 		m.policies[principal] = policy
 	}
 	if revision > 0 {

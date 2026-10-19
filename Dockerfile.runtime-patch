@@ -1,0 +1,9 @@
+# Preserve Osaka's deployed runtime dependencies; replace only the static binary.
+ARG BASE_IMAGE=ghcr.io/ai-router-lgtm/sing-box@sha256:b0fe945138e5729fb238c1f0f71898132b073dc1cb3ecbe329939299a256afda
+FROM ${BASE_IMAGE}
+ARG TARGETARCH
+ARG SOURCE_REVISION
+ARG VERSION
+LABEL org.opencontainers.image.revision=${SOURCE_REVISION}
+LABEL org.opencontainers.image.version=${VERSION}
+COPY sing-box-${TARGETARCH} /usr/local/bin/sing-box

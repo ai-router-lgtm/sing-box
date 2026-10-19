@@ -240,6 +240,8 @@ func TestDisconnectSelectorsHundredUsersSingleScan(t *testing.T) {
 }
 
 func TestDisconnectSelectorsClosesWithBoundedConcurrency(t *testing.T) {
+	t.Parallel()
+
 	manager := NewManager()
 	var active atomic.Int64
 	var maximum atomic.Int64
